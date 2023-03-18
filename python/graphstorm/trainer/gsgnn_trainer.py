@@ -1,6 +1,5 @@
 """ GraphStorm trainer base """
 import os
-import copy
 import psutil
 import torch as th
 
