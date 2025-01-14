@@ -16,14 +16,16 @@
     Generate example graph data using built-in datasets for node classifcation,
     node regression, edge classification and edge regression.
 """
+import os
 import logging
-
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
 
+from .file_io import read_data_parquet
 from .utils import ExtMemArrayWrapper
+
+GIB_BYTES = 1024**3
 
 class NoopMap:
     """ It doesn't map IDs.
@@ -66,6 +68,68 @@ class NoopMap:
             The file where the ID map is saved to.
         """
 
+class IdReverseMap:
+    """ Map GraphStorm node ID into original Node ID
+
+        This loads an ID map for output IDs.
+
+        Parameters
+        ----------
+        id_map_prefix : str
+            Id mapping file prefix
+    """
+    def __init__(self, id_map_prefix):
+        assert os.path.exists(id_map_prefix), \
+            f"{id_map_prefix} does not exist."
+        try:
+            data = read_data_parquet(id_map_prefix, ["orig", "new"])
+        except AssertionError:
+            # To maintain backwards compatibility with GraphStorm v0.2.1
+            data = read_data_parquet(id_map_prefix, ["node_str_id", "node_int_id"])
+            data["new"] = data["node_int_id"]
+            data["orig"] = data["node_str_id"]
+            data.pop("node_int_id")
+            data.pop("node_str_id")
+
+        sort_idx = np.argsort(data['new'])
+        self._ids = data['orig'][sort_idx]
+
+    def __len__(self):
+        return len(self._ids)
+
+    def map_range(self, start, end):
+        """ Map a range of GraphStorm IDs to the raw IDs.
+
+        Parameters
+        ----------
+        start : int
+            Starting idx
+        end: int
+            Ending indx
+
+        Returns
+        -------
+        tensor: A numpy array of raw IDs.
+        """
+        return self._ids[start:end]
+
+    def map_id(self, ids):
+        """ Map the GraphStorm IDs to the raw IDs.
+
+        Parameters
+        ----------
+        ids : numpy array
+            The input IDs
+
+        Returns
+        -------
+        tensor: A numpy array of raw IDs.
+        """
+        if len(ids) == 0:
+            return np.array([], dtype=np.str)
+
+        return self._ids[ids]
+
 class IdMap:
     """ Map an ID to a new ID.
 
@@ -95,6 +159,16 @@ class IdMap:
     def __len__(self):
         return len(self._ids)
 
+    @property
+    def map_key_dtype(self):
+        """ Return the data type of map keys.
+        """
+        for id_ in self._ids:
+            if isinstance(id_, np.ndarray):
+                return id_.dtype
+            else:
+                return type(id_)
+
     def map_id(self, ids):
         """ Map the input IDs to the new IDs.
 
@@ -107,6 +181,8 @@ class IdMap:
         -------
         tuple of tensors : the tensor of new IDs, the location of the IDs in the input ID tensor.
         """
+        if len(ids) == 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
         for id_ in self._ids:
             # If the data type of the key is string, the input Ids should not be integer.
             if isinstance(id_, str):
@@ -136,29 +212,40 @@ class IdMap:
                 idx.append(i)
         return np.array(new_ids), np.array(idx)
 
-    def save(self, file_path):
-        """ Save the ID map to a parquet file.
+    def save(self, file_prefix):
+        """ Save the ID map to a set of parquet files.
+
+        Files are split such that they are not significantly larger
+        than 1GB per file.
 
         Parameters
         ----------
-        file_path : str
-            The file where the ID map will be saved to.
+        file_prefix : str
+            The file prefix under which the ID map will be saved to.
 
-        Returns
-        -------
-        bool : whether the ID map is saved to a file.
         """
-        keys = list(self._ids.keys())
-        vals = list(self._ids.values())
-        table = pa.Table.from_pandas(pd.DataFrame({'orig': keys, 'new': vals}))
-        pq.write_table(table, file_path)
-        return True
+        os.makedirs(file_prefix, exist_ok=True)
+        table = pa.Table.from_arrays([pa.array(self._ids.keys()), self._ids.values()],
+                                     names=["orig", "new"])
+        bytes_per_row = table.nbytes // table.num_rows
+        # Split table in parts, such that the max expected file size is ~1GB
+        max_rows_per_file = GIB_BYTES // bytes_per_row
+        rows_written = 0
+        file_idx = 0
+        while rows_written < table.num_rows:
+            start = rows_written
+            end = min(rows_written + max_rows_per_file, table.num_rows)
+            filename = f"part-{str(file_idx).zfill(5)}.parquet"
+            pq.write_table(table.slice(start, end), os.path.join(file_prefix, filename))
+            rows_written = end
+            file_idx += 1
 
 def map_node_ids(src_ids, dst_ids, edge_type, node_id_map, skip_nonexist_edges):
     """ Map node IDs of source and destination nodes of edges.
 
     In the ID mapping, we need to handle multiple errors in the input data:
-    1) we handle the case that endpoint nodes of edges don't exist;
+    1) we handle the case that endpoint nodes of edges don't exist; if all endpoint nodes
+    do not exist, we return an empty edge list.
     2) we handle the case that the data type of node IDs of the endpoint nodes don't
     match the data type of the keys of the ID map.
 
@@ -177,33 +264,50 @@ def map_node_ids(src_ids, dst_ids, edge_type, node_id_map, skip_nonexist_edges):
 
     Returns
     -------
-    tuple of tensors : the remapped source and destination node IDs.
+    tuple of tensors :
+        src_ids: The remapped source node IDs.
+        dst_ids: The remapped destination node IDs.
+        src_exist_locs: The locations of source node IDs that
+                        have existing edges. Only valid when
+                        skip_nonexist_edges is True.
+        dst_exist_locs: The location of destination node IDs that
+                        have existing edges. Only valid when
+                        skip_nonexist_edges is True.
+
+        How to use src_exist_locs and dst_exist_locs:
+        feat_data = feat_data[src_exist_locs][dst_exist_locs]
     """
     src_type, _, dst_type = edge_type
     new_src_ids, orig_locs = node_id_map[src_type].map_id(src_ids)
+    src_exist_locs = None
+    dst_exist_locs = None
     # If some of the source nodes don't exist in the node set.
     if len(orig_locs) != len(src_ids):
         bool_mask = np.ones(len(src_ids), dtype=bool)
-        bool_mask[orig_locs] = False
+        if len(orig_locs) > 0:
+            bool_mask[orig_locs] = False
         if skip_nonexist_edges:
-            logging.warning("source nodes of %s do not exist: %s",
-                            src_type, str(src_ids[bool_mask]))
+            logging.warning("source nodes of %s do not exist. Skip %d edges",
+                            src_type, len(src_ids[bool_mask]))
         else:
             raise ValueError(f"source nodes of {src_type} do not exist: {src_ids[bool_mask]}")
-        dst_ids = dst_ids[orig_locs]
+        dst_ids = dst_ids[orig_locs] if len(orig_locs) > 0 else np.array([], dtype=dst_ids.dtype)
+        src_exist_locs = orig_locs
     src_ids = new_src_ids
 
     new_dst_ids, orig_locs = node_id_map[dst_type].map_id(dst_ids)
     # If some of the dest nodes don't exist in the node set.
     if len(orig_locs) != len(dst_ids):
         bool_mask = np.ones(len(dst_ids), dtype=bool)
-        bool_mask[orig_locs] = False
+        if len(orig_locs) > 0:
+            bool_mask[orig_locs] = False
         if skip_nonexist_edges:
-            logging.warning("dest nodes of %s do not exist: %s",
-                            dst_type, str(dst_ids[bool_mask]))
+            logging.warning("dest nodes of %s do not exist. Skip %d edges",
+                            dst_type, len(dst_ids[bool_mask]))
         else:
             raise ValueError(f"dest nodes of {dst_type} do not exist: {dst_ids[bool_mask]}")
         # We need to remove the source nodes as well.
-        src_ids = src_ids[orig_locs]
+        src_ids = src_ids[orig_locs] if len(orig_locs) > 0 else np.array([], dtype=src_ids.dtype)
+        dst_exist_locs = orig_locs
     dst_ids = new_dst_ids
-    return src_ids, dst_ids
+    return src_ids, dst_ids, src_exist_locs, dst_exist_locs

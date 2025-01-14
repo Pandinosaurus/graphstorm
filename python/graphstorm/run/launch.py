@@ -30,13 +30,16 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
+import copy
+
 from functools import partial
 from threading import Thread
-from typing import Optional
+from typing import List, Optional
 from argparse import REMAINDER
 
 
-def cleanup_proc(get_all_remote_pids_func, conn):
+def remote_cleanup_proc(get_all_remote_pids_func, conn):
     """This process tries to clean up the remote training tasks.
 
         Parameters
@@ -46,7 +49,7 @@ def cleanup_proc(get_all_remote_pids_func, conn):
         conn:
             connection
     """
-    print("cleanupu process runs")
+    logging.debug("cleanupu process runs")
     # This process should not handle SIGINT.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -58,11 +61,11 @@ def cleanup_proc(get_all_remote_pids_func, conn):
         remote_pids = get_all_remote_pids_func()
         # Otherwise, we need to ssh to each machine and kill the training jobs.
         for (ip, port), pids in remote_pids.items():
-            kill_process(ip, port, pids)
-    print("cleanup process exits")
+            kill_remote_process(ip, port, pids)
+    logging.debug("cleanup process exits")
 
 
-def kill_process(ip, port, pids):
+def kill_remote_process(ip, port, pids):
     """ssh to a remote machine and kill the specified processes.
 
         Parameters
@@ -80,8 +83,9 @@ def kill_process(ip, port, pids):
     # to Python's process pool. After sorting, we always kill parent processes first.
     pids.sort()
     for pid in pids:
-        assert curr_pid != pid
-        print("kill process {} on {}:{}".format(pid, ip, port), flush=True)
+        if curr_pid == pid:
+            continue
+        logging.debug("kill process %d on %s:%d", pid, ip, port)
         kill_cmd = (
             "ssh -o StrictHostKeyChecking=no -p "
             + str(port)
@@ -93,15 +97,13 @@ def kill_process(ip, port, pids):
         killed_pids.append(pid)
     # It's possible that some of the processes are not killed. Let's try again.
     for _ in range(3):
-        killed_pids = get_killed_pids(ip, port, killed_pids)
+        killed_pids = get_remote_killed_pids(ip, port, killed_pids)
         if len(killed_pids) == 0:
             break
 
         killed_pids.sort()
         for pid in killed_pids:
-            print(
-                "kill process {} on {}:{}".format(pid, ip, port), flush=True
-            )
+            logging.debug("kill process %d on %s:%d", pid, ip, port)
             kill_cmd = (
                 "ssh -o StrictHostKeyChecking=no -p "
                 + str(port)
@@ -112,7 +114,7 @@ def kill_process(ip, port, pids):
             subprocess.run(kill_cmd, shell=True, check=False)
 
 
-def get_killed_pids(ip, port, killed_pids):
+def get_remote_killed_pids(ip, port, killed_pids):
     """Get the process IDs that we want to kill but are still alive.
 
         Parameters
@@ -133,6 +135,84 @@ def get_killed_pids(ip, port, killed_pids):
         + ip
         + " 'ps -p {} -h'".format(killed_pids)
     )
+    res = subprocess.run(ps_cmd, shell=True, stdout=subprocess.PIPE, check=False)
+    pids = []
+    for process in res.stdout.decode("utf-8").split("\n"):
+        process_list = process.split()
+        if len(process_list) > 0:
+            pids.append(int(process_list[0]))
+    return pids
+
+
+def local_cleanup_proc(get_all_pids_func, conn):
+    """This process tries to clean up the local training tasks.
+
+        Parameters
+        ----------
+        get_all_pids: func
+            Function to get all pids
+        conn:
+            connection
+    """
+    logging.debug("cleanup process runs")
+    # This process should not handle SIGINT.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    data = conn.recv()
+    # If the launch process exits normally, this process doesn't need to do anything.
+    if data == "exit":
+        sys.exit(0)
+    else:
+        pids = get_all_pids_func()
+        for pids in pids.items():
+            kill_local_process(pids)
+    logging.debug("cleanup process exits")
+
+
+def kill_local_process(pids):
+    """kill the specified processes on the local machine.
+
+        Parameters
+        ----------
+        pids: list
+            Pid list
+    """
+    curr_pid = os.getpid()
+    killed_pids = []
+    # If we kill child processes first, the parent process may create more again. This happens
+    # to Python's process pool. After sorting, we always kill parent processes first.
+    pids.sort()
+    for pid in pids:
+        if curr_pid == pid:
+            continue
+        logging.debug("kill process %d", pid)
+        kill_cmd = "'kill {}'".format(pid)
+        subprocess.run(kill_cmd, shell=True, check=False)
+        killed_pids.append(pid)
+    # It's possible that some of the processes are not killed. Let's try again.
+    for _ in range(3):
+        killed_pids = get_local_killed_pids(killed_pids)
+        if len(killed_pids) == 0:
+            break
+
+        killed_pids.sort()
+        for pid in killed_pids:
+            logging.debug("kill process %d", pid)
+            kill_cmd = "'kill -9 {}'".format(pid)
+            subprocess.run(kill_cmd, shell=True, check=False)
+
+
+def get_local_killed_pids(killed_pids):
+    """Get the process IDs that we want to kill but are still alive.
+
+        Parameters
+        ----------
+        killed_pids: list
+            Pid list
+    """
+    killed_pids = [str(pid) for pid in killed_pids]
+    killed_pids = ",".join(killed_pids)
+    ps_cmd = "'ps -p {} -h'".format(killed_pids)
     res = subprocess.run(ps_cmd, shell=True, stdout=subprocess.PIPE, check=False)
     pids = []
     for process in res.stdout.decode("utf-8").split("\n"):
@@ -188,7 +268,7 @@ def execute_remote(
             subprocess.check_call(ssh_cmd, shell=True)
             state_q.put(0)
         except subprocess.CalledProcessError as err:
-            print(f"Called process error {err}")
+            logging.error("Called process error %s", err)
             state_q.put(err.returncode)
         except Exception: # pylint: disable=broad-exception-caught
             state_q.put(-1)
@@ -200,12 +280,52 @@ def execute_remote(
             state_q,
         ),
     )
-    thread.setDaemon(True)
+    thread.daemon = True
     thread.start()
     # sleep for a while in case of ssh is rejected by peer due to busy connection
     time.sleep(0.2)
     return thread
 
+def execute_local(
+    cmd: str,
+    state_q: queue.Queue,
+) -> Thread:
+    """Execute command line on the local machine.
+
+        Parameters
+        ----------
+        cmd:
+            User-defined command (udf) to execute on the local host.
+        state_q:
+            A queue collecting Thread exit states.
+
+    Returns:
+        thread: The Thread whose run() is to run the `cmd` on the local host.
+        Returns when the cmd completes.
+    """
+    # thread func to run the job
+    def run(cmd, state_q):
+        try:
+            subprocess.check_call(cmd, shell=True)
+            state_q.put(0)
+        except subprocess.CalledProcessError as err:
+            logging.error("Called process error %s", err)
+            state_q.put(err.returncode)
+        except Exception: # pylint: disable=broad-exception-caught
+            state_q.put(-1)
+
+    thread = Thread(
+        target=run,
+        args=(
+            cmd,
+            state_q,
+        ),
+    )
+    thread.daemon = True
+    thread.start()
+    # sleep for a while in case of ssh is rejected by peer due to busy connection
+    time.sleep(0.2)
+    return thread
 
 def get_remote_pids(ip, port, cmd_regex):
     """Get the process IDs that run the command in the remote machine.
@@ -281,6 +401,56 @@ def get_all_remote_pids(hosts, ssh_port, udf_command):
         remote_pids[(ip, ssh_port)] = pids
     return remote_pids
 
+def get_local_pids(cmd_regex):
+    """Get the process IDs that run the command in the local machine.
+
+        Parameters
+        ----------
+        cmd_regex:
+            command pattern
+    """
+    pids = []
+    curr_pid = os.getpid()
+    # Here we want to get the python processes.
+    ps_cmd = (
+        "ps -aux | grep python"
+    )
+    res = subprocess.run(ps_cmd, shell=True, stdout=subprocess.PIPE, check=False)
+    for process in res.stdout.decode("utf-8").split("\n"):
+        process_list = process.split()
+        if len(process_list) < 2:
+            continue
+        # We only get the processes that run the specified command.
+        res = re.search(cmd_regex, process)
+        if res is not None and int(process_list[1]) != curr_pid:
+            pids.append(process_list[1])
+
+    pid_str = ",".join([str(pid) for pid in pids])
+    ps_cmd = (
+        "pgrep -P {}".format(pid_str)
+    )
+    res = subprocess.run(ps_cmd, shell=True, stdout=subprocess.PIPE, check=False)
+    pids1 = res.stdout.decode("utf-8").split("\n")
+    all_pids = []
+    for pid in set(pids + pids1):
+        if pid == "" or int(pid) == curr_pid:
+            continue
+        all_pids.append(int(pid))
+    all_pids.sort()
+    return all_pids
+
+def get_all_local_pids(udf_command):
+    """Get all processes in the local machine.
+
+        Parameters
+        ----------
+        udf_command:
+            command
+    """
+    # When creating training processes in remote machines, we may insert some arguments
+    # in the commands. We need to use regular expressions to match the modified command.
+    new_udf_command = " .*".join(udf_command)
+    return get_local_pids(new_udf_command)
 
 def construct_torch_dist_launcher_cmd(
     num_trainers: int,
@@ -324,6 +494,64 @@ def construct_torch_dist_launcher_cmd(
         master_addr=master_addr,
         master_port=master_port,
     )
+
+def wrap_dist_remap_command(
+        udf_command: List[str],
+        rank: int,
+        world_size: int,
+        with_shared_fs: bool,
+        num_trainers: int,
+        output_chunk_size: int = 100000,
+        preserve_input: bool = False) -> str:
+    """ Wrap distributed remap command
+
+        Parameters
+        ----------
+        udf_command:
+            Execution command.
+        rank:
+            Worker's rank in a distributed cluster.
+        world_size:
+            Total number of workers
+        with_shared_fs:
+            Whether all files are stored in a shared fs.
+        num_trainers:
+            Number of trainers on each machine.
+        output_chunk_size:
+            Number of rows per output file.
+        preserve_input:
+            Whether we preserve the input data.
+
+        Returns
+        -------
+        A string of remap_result launch command that combines the original arguments list
+        with remap specific arguments.
+    """
+    # Get the python interpreter used right now.
+    # If we can not get it we go with the default `python3`
+    python_bin = sys.executable \
+        if sys.executable is not None and sys.executable != "" \
+        else "python3 "
+
+    new_udf_command = copy.deepcopy(udf_command)
+    new_udf_command[0] = "graphstorm.gconstruct.remap_result"
+
+    # Add remap related arguments
+    new_udf_command += ["--rank", str(rank)]
+    new_udf_command += ["--world-size", str(world_size)]
+    new_udf_command += ["--with-shared-fs", "True" if with_shared_fs else "False"]
+    new_udf_command += ["--num-processes", str(num_trainers)]
+    new_udf_command += ["--output-chunk-size", str(output_chunk_size)]
+    new_udf_command += ["--preserve-input", "True" if preserve_input else "False"]
+
+    # transforms the udf_command from:
+    #     path/to/dist_trainer.py arg0 arg1
+    # to:
+    #     python -m torch.distributed.launch [DIST TORCH ARGS] path/to/dist_trainer.py arg0 arg1
+    new_udf_command = " ".join(new_udf_command)
+    new_udf_command = f"{python_bin} -m {new_udf_command}"
+
+    return new_udf_command
 
 
 def wrap_udf_in_torch_dist_launcher(
@@ -548,7 +776,7 @@ def wrap_cmd_with_local_envvars(cmd: str, env_vars: str) -> str:
     return f"(export {env_vars}; {cmd})"
 
 
-def wrap_cmd_with_extra_envvars(cmd: str, env_vars: list) -> str:
+def wrap_cmd_with_extra_envvars(cmd: str, env_vars: List[str]) -> str:
     """Wraps a CLI command with extra env vars
 
     Example:
@@ -567,8 +795,7 @@ def wrap_cmd_with_extra_envvars(cmd: str, env_vars: list) -> str:
     Returns:
         cmd_with_env_vars:
     """
-    env_vars = " ".join(env_vars)
-    return wrap_cmd_with_local_envvars(cmd, env_vars)
+    return wrap_cmd_with_local_envvars(cmd, " ".join(env_vars))
 
 GLOBAL_GROUP_ID = 0
 
@@ -593,9 +820,6 @@ def update_udf_command(udf_command, args):
     udf_command.append("--part-config")
     udf_command.append(args.part_config)
 
-    udf_command.append("--verbose")
-    udf_command.append(str(args.verbose))
-
     return udf_command
 
 def get_available_port(ip):
@@ -616,9 +840,141 @@ def get_available_port(ip):
             return port
     raise RuntimeError("Failed to get available port for ip~{}".format(ip))
 
+def submit_remap_jobs(args, udf_command, hosts, run_local):
+    """Submit distributed remap jobs via ssh
+
+        Parameters
+        ----------
+        args:
+            Launch arguments
+        udf_command: list
+            Execution arguments to update
+        hosts : list
+            The machines where to run the distributed job.
+        run_local : bool
+            Whether it runs on the local machine.
+    """
+    clients_cmd = []
+    thread_list = []
+    state_q = queue.Queue()
+
+    pythonpath=os.environ.get("PYTHONPATH", "")
+    env_vars = f"PYTHONPATH={pythonpath} "
+
+    for node_id, host in enumerate(hosts):
+        ip, _ = host
+        remap_dist_command = wrap_dist_remap_command(udf_command,
+                                                     node_id,
+                                                     len(hosts),
+                                                     args.with_shared_fs,
+                                                     args.num_trainers,
+                                                     args.output_chunk_size,
+                                                     args.preserve_input)
+
+        cmd = wrap_cmd_with_local_envvars(remap_dist_command, env_vars)
+        cmd = (
+            wrap_cmd_with_extra_envvars(cmd, args.extra_envs)
+            if len(args.extra_envs) > 0
+            else cmd
+        )
+
+        cmd = "cd " + str(args.workspace) + "; " + cmd
+        clients_cmd.append(cmd)
+        if run_local:
+            thread_list.append(execute_local(cmd, state_q))
+        else:
+            thread_list.append(
+                    execute_remote(
+                        cmd, state_q, ip, args.ssh_port, username=args.ssh_username
+                    )
+            )
+        logging.debug(cmd)
+        logging.info(cmd)
+
+    # Start a cleanup process dedicated for cleaning up remote jobs.
+    conn1, conn2 = multiprocessing.Pipe()
+    if run_local:
+        func = partial(get_all_local_pids, udf_command)
+        process = multiprocessing.Process(target=local_cleanup_proc, args=(func, conn1))
+    else:
+        func = partial(get_all_remote_pids, hosts, args.ssh_port, udf_command)
+        process = multiprocessing.Process(target=remote_cleanup_proc, args=(func, conn1))
+    process.start()
+
+    def signal_handler(sig, frame): # pylint: disable=unused-argument
+        logging.info("Stop launcher")
+        # We need to tell the cleanup process to kill remote training jobs.
+        conn2.send("cleanup")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    err = 0
+    for thread in thread_list:
+        thread.join()
+        err_code = state_q.get()
+        if err_code != 0:
+            # Record err_code
+            # We record one of the error if there are multiple
+            err = err_code
+
+    # The remap processes complete. We should tell the cleanup process to exit.
+    conn2.send("exit")
+    process.join()
+    if err != 0:
+        logging.error("Remapping task failed")
+        sys.exit(-1)
+
+def get_ip_config(ip_config, workspace):
+    """ Get IP configurations
+
+    Parameters
+    ----------
+    ip_config : str
+        The path to the IP config file.
+    workspace : str
+        The path of the workspace
+
+    Returns
+    -------
+    str : the absolute path of IP configuration file.
+    list of tuple : the IP address and ports of the hosts.
+    """
+    # Get the IP addresses of the cluster.
+    # The path to the ip config file can be a absolute path or
+    # a relative path to the workspace
+    hosts = []
+    if ip_config is not None:
+        ip_config = ip_config if os.path.isabs(ip_config) else \
+                os.path.join(workspace, ip_config)
+        assert os.path.isfile(ip_config), \
+                f"IP config file must be provided but got {ip_config}"
+        with open(ip_config, encoding='utf-8') as f:
+            for line in f:
+                result = line.strip().split()
+                if len(result) == 2:
+                    ip = result[0]
+                    port = int(result[1])
+                    hosts.append((ip, port))
+                elif len(result) == 1:
+                    ip = result[0]
+                    port = get_available_port(ip)
+                    hosts.append((ip, port))
+                else:
+                    raise RuntimeError("Format error of ip_config.")
+    else:
+        # The user doesn't provide an IP config file. This means we are going to
+        # run the training job in the local machine. We should create a temporary
+        # IP config file.
+        with tempfile.NamedTemporaryFile(delete=False) as fp: # pylint: disable=invalid-name
+            fp.write(b'127.0.0.1')
+            ip_config = fp.name
+            fp.close()
+        logging.debug('create a temporary ip config file: %s', ip_config)
+    return ip_config, hosts
 
 def submit_jobs(args, udf_command):
-    """Submit distributed jobs (server and client processes) via ssh
+    """Submit distributed jobs (server and client processes).
 
         Parameters
         ----------
@@ -633,29 +989,14 @@ def submit_jobs(args, udf_command):
     thread_list = []
     server_count_per_machine = 0
 
-    # Get the IP addresses of the cluster.
-    # The path to the ip config file can be a absolute path or
-    # a relative path to the workspace
-    ip_config = args.ip_config if os.path.isabs(args.ip_config) else \
-        os.path.join(args.workspace, args.ip_config)
+    ip_config, hosts = get_ip_config(args.ip_config, args.workspace)
     args.ip_config = ip_config
-    assert os.path.isfile(ip_config), \
-        f"IP config file must be provided but got {ip_config}"
-
-    with open(ip_config, encoding='utf-8') as f:
-        for line in f:
-            result = line.strip().split()
-            if len(result) == 2:
-                ip = result[0]
-                port = int(result[1])
-                hosts.append((ip, port))
-            elif len(result) == 1:
-                ip = result[0]
-                port = get_available_port(ip)
-                hosts.append((ip, port))
-            else:
-                raise RuntimeError("Format error of ip_config.")
-            server_count_per_machine = args.num_servers
+    server_count_per_machine = args.num_servers
+    if len(hosts) == 0:
+        hosts = [("127.0.0.1", None)]
+        run_local = True
+    else:
+        run_local = False
 
     # Get partition info of the graph data
     # The path to the partition config file can be a absolute path or
@@ -686,13 +1027,12 @@ def submit_jobs(args, udf_command):
         num_server_threads=args.num_server_threads,
         tot_num_clients=tot_num_clients,
         part_config=args.part_config,
-        ip_config=args.ip_config,
+        ip_config=ip_config,
         num_servers=args.num_servers,
         graph_format=args.graph_format,
         pythonpath=os.environ.get("PYTHONPATH", ""),
     )
     for i in range(len(hosts) * server_count_per_machine):
-        ip, _ = hosts[int(i / server_count_per_machine)]
         server_env_vars_cur = f"{server_env_vars} DGL_SERVER_ID={i}"
         cmd = wrap_cmd_with_local_envvars(server_cmd, server_env_vars_cur)
         cmd = (
@@ -703,22 +1043,19 @@ def submit_jobs(args, udf_command):
         cmd = "cd " + str(args.workspace) + "; " + cmd
         servers_cmd.append(cmd)
 
-        thread_list.append(
-            execute_remote(
-                cmd,
-                state_q,
-                ip,
-                args.ssh_port,
-                username=args.ssh_username,
-            )
-        )
+        if not run_local:
+            ip, _ = hosts[int(i / server_count_per_machine)]
+            thread_list.append(
+                    execute_remote(cmd, state_q, ip, args.ssh_port, username=args.ssh_username))
+        else:
+            thread_list.append(execute_local(cmd, state_q))
 
     # launch client tasks
     client_env_vars = construct_dgl_client_env_vars(
         num_samplers=args.num_samplers,
         tot_num_clients=tot_num_clients,
         part_config=args.part_config,
-        ip_config=args.ip_config,
+        ip_config=ip_config,
         num_servers=args.num_servers,
         graph_format=args.graph_format,
         num_omp_threads=os.environ.get(
@@ -731,7 +1068,6 @@ def submit_jobs(args, udf_command):
     master_addr = hosts[0][0]
     master_port = get_available_port(master_addr)
     for node_id, host in enumerate(hosts):
-        ip, _ = host
         # Transform udf_command to follow torch's dist launcher format:
         # `PYTHON_BIN -m torch.distributed.launch ... UDF`
         torch_dist_udf_command = wrap_udf_in_torch_dist_launcher(
@@ -752,19 +1088,23 @@ def submit_jobs(args, udf_command):
         )
         cmd = "cd " + str(args.workspace) + "; " + cmd
         clients_cmd.append(cmd)
-        thread_list.append(
-            execute_remote(
-                cmd, state_q, ip, args.ssh_port, username=args.ssh_username
+        if not run_local:
+            ip, _ = host
+            thread_list.append(
+                    execute_remote(cmd, state_q, ip, args.ssh_port, username=args.ssh_username)
             )
-        )
-
-        if args.verbose:
-            print(torch_dist_udf_command)
+        else:
+            thread_list.append(execute_local(cmd, state_q))
+        logging.debug(torch_dist_udf_command)
 
     # Start a cleanup process dedicated for cleaning up remote training jobs.
     conn1, conn2 = multiprocessing.Pipe()
-    func = partial(get_all_remote_pids, hosts, args.ssh_port, udf_command)
-    process = multiprocessing.Process(target=cleanup_proc, args=(func, conn1))
+    if run_local:
+        func = partial(get_all_local_pids, udf_command)
+        process = multiprocessing.Process(target=local_cleanup_proc, args=(func, conn1))
+    else:
+        func = partial(get_all_remote_pids, hosts, args.ssh_port, udf_command)
+        process = multiprocessing.Process(target=remote_cleanup_proc, args=(func, conn1))
     process.start()
 
     def signal_handler(sig, frame): # pylint: disable=unused-argument
@@ -788,8 +1128,13 @@ def submit_jobs(args, udf_command):
     conn2.send("exit")
     process.join()
     if err != 0:
-        print("Task failed")
+        logging.error("Task failed")
         sys.exit(-1)
+
+    logging.info("Start doing node id remapping")
+    if args.do_nid_remap:
+        submit_remap_jobs(args, udf_command, hosts, run_local)
+    logging.info("Finish doing node id remapping")
 
 def get_argument_parser():
     """ Arguments listed here are those used by the launch script to launch
@@ -806,11 +1151,12 @@ def get_argument_parser():
               then the ssh command will be like: 'ssh bob@1.2.3.4 CMD' "
              "instead of 'ssh 1.2.3.4 CMD'",
     )
+    # We should deprecate it.
     parser.add_argument(
         "--verbose",
         type=lambda x: (str(x).lower() in ['true', '1']),
         default=False,
-        help="Print more information.",
+        help="Print more information. This argument is deprecated and is no longer effective.",
     )
     parser.add_argument(
         "--workspace",
@@ -893,6 +1239,44 @@ def get_argument_parser():
             No GNN is involved, only graph structure. \
             Used with built-in training/inference scripts"
     )
+    parser.add_argument(
+        "--do-nid-remap",
+        type=lambda x: (str(x).lower() in ['true', '1']),
+        default=True,
+        help="Do Graph Node ID space to Raw Node ID space remapping."
+        "If not set, the default behavior is to do remap."
+    )
+
+    parser = add_remap_result_args(parser)
+    return parser
+
+def add_remap_result_args(parser):
+    """ Add node id remapping related arguments
+
+        Output_chunk_size is used to control the max number of raws of each
+        output (e.g., parquet) file.
+        Preserve_input is used to indicate whether GSF will keep the un-remapped data
+        in the output folder. The main purpose of setting preserve_input to True is
+        for debugging.
+        With_shared_fs tells whether the task is running on a system without shared
+        file system support (e.g., SageMaker). The main purpose of this argument is
+        supporting SageMaker.
+
+    Parameters
+    ----------
+    parser:
+        ArgParser
+    """
+    group = parser.add_argument_group(title="remap")
+    group.add_argument("--output-chunk-size", type=int, default=100000,
+                       help="Number of rows per output file.")
+    group.add_argument("--preserve-input", type=bool, default=False,
+                       help="Whether we preserve the input data.")
+    group.add_argument("--with-shared-fs",
+                       type=lambda x: (str(x).lower() in ["true", "1"]),
+                       default=True,
+                       help="Whether all files are stored in a shared file system"
+                            "False when it is running on SageMaker")
     return parser
 
 def check_input_arguments(args):
@@ -914,10 +1298,7 @@ def check_input_arguments(args):
     ), "--num-servers must be a positive number."
     assert (
         args.part_config is not None
-    ), "A user has to specify a partition configuration file with --part-onfig."
-    assert (
-        args.ip_config is not None
-    ), "A user has to specify an IP configuration file with --ip-config."
+    ), "A user has to specify a partition configuration file with --part-config."
 
     if args.workspace is None:
         # Get PWD
@@ -937,8 +1318,8 @@ def check_input_arguments(args):
         args.num_omp_threads = max(
             cpu_cores_per_trainer, 1
         )
-        if args.verbose:
-            print(f"The number of OMP threads per trainer is set to {args.num_omp_threads}")
+        logging.debug("The number of OMP threads per trainer is set to %d",
+                      args.num_omp_threads)
     else:
         assert args.num_omp_threads > 0, \
             "The number of OMP threads per trainer should be larger than 0"
@@ -950,8 +1331,8 @@ def check_input_arguments(args):
         args.num_server_threads = max(
             cpu_cores_per_server, 1
         )
-        if args.verbose:
-            print(f"The number of OMP threads per server is set to {args.num_server_threads}")
+        logging.debug("The number of OMP threads per server is set to %d",
+                      args.num_server_threads)
     else:
         assert args.num_server_threads > 0, \
             "The number of OMP threads per server should be larger than 1"

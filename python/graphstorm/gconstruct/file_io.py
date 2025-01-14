@@ -20,6 +20,8 @@ from functools import partial
 import glob
 import json
 import os
+import logging
+from typing import Union, List
 
 import pyarrow.parquet as pq
 import pyarrow as pa
@@ -28,6 +30,103 @@ import h5py
 import pandas as pd
 
 from .utils import HDF5Handle, HDF5Array
+
+
+def read_index(split_info):
+    """ Read the index from a JSON/parquet file.
+
+    Parameters
+    ----------
+    split_info : dict
+        Customized split information
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Returns a tuple containing three numpy arrays:
+        - First element: Data from the training split, if not available, [].
+        - Second element: Data from the validation split, if not available, [].
+        - Third element: Data from the test split, if not available, [].
+        If the file extension is not '.json' or '.parquet', a ValueError is raised.
+    """
+    res = []
+    for idx in ['train', 'valid', 'test']:
+        if idx not in split_info:
+            res.append([])
+            continue
+        if isinstance(split_info[idx], str):
+            _, extension = os.path.splitext(split_info[idx])
+        else:
+            extensions = [os.path.splitext(path)[1] for path in split_info[idx]]
+            assert len(set(extensions)) == 1, f"each file should be in the same format, " \
+                                   f"but get {extensions}"
+            extension = extensions[0]
+
+        # Normalize the extension to ensure case insensitivity
+        extension = extension.lower()
+
+        # json files should be ended with .json and parquet files should be ended with parquet
+        if extension == '.json':
+            res.append(read_index_json(split_info[idx]))
+        elif extension == '.parquet':
+            # We should make sure there are multiple parquet files instead of one
+            res.append(read_index_parquet(split_info[idx], split_info['column']))
+        else:
+            raise ValueError(f"Expect mask data format be one of parquet "
+                             f"and json, but get {extension}")
+    return res[0], res[1], res[2]
+
+
+def expand_wildcard(data_files: List[str]) -> List[str]:
+    """
+    Expand a list of paths that can contain wildcards to the actual file lists.
+
+    Parameters
+    ----------
+    data_files : list[str]
+        The parquet files that contain the index.
+
+    """
+    expanded_files = []
+    if len(data_files) == 1 and os.path.isdir(data_files[0]):
+        data_files = [os.path.join(data_files[0], "*")]
+    for item in data_files:
+        if '*' in item:
+            matched_files = sorted(glob.glob(item))
+            assert len(matched_files) > 0, \
+                f"There is no file matching {item} pattern"
+            expanded_files.extend(matched_files)
+        else:
+            expanded_files.append(item)
+    return expanded_files
+
+def read_index_parquet(data_file, column):
+    """
+    Read the index from a parquet file.
+
+    Parameters
+    ----------
+    data_file : str or list[str]
+        The parquet file that contains the index.
+    column: list[str]
+        Column names on parquet which contain the index
+
+    """
+    if isinstance(data_file, str):
+        data_file = [data_file]
+    data_file = expand_wildcard(data_file)
+    df_list = [pd.read_parquet(file) for file in data_file]
+    df = pd.concat(df_list, ignore_index=True)
+
+    if len(column) == 1:
+        res_array = df[column[0]].to_numpy()
+    elif len(column) == 2:
+        res_array = list(zip(df[column[0]].to_numpy(), df[column[1]].to_numpy()))
+    else:
+        raise ValueError("The Parquet file on node mask must contain exactly one column, "
+                         "and on edge mask must contain exactly two columns.")
+
+    return res_array
 
 def read_index_json(data_file):
     """ Read the index from a JSON file.
@@ -46,8 +145,14 @@ def read_index_json(data_file):
     with open(data_file, 'r', encoding="utf8") as json_file:
         indices = []
         for line in json_file.readlines():
-            indices.append(json.loads(line))
-    return np.array(indices)
+            parsed_line = json.loads(line)
+            if isinstance(parsed_line, list):
+                processed_item = tuple(parsed_line)
+            else:
+                processed_item = parsed_line
+
+            indices.append(processed_item)
+    return indices
 
 def write_index_json(data, data_file):
     """ Write the index to a json file.
@@ -59,9 +164,11 @@ def write_index_json(data, data_file):
     data_file : str
         The data file where the indices are written to.
     """
+    if isinstance(data, np.ndarray):
+        data = data.tolist()
     with open(data_file, 'w', encoding="utf8") as json_file:
         for index in data:
-            json_file.write(json.dumps(int(index)) + "\n")
+            json_file.write(json.dumps(index) + "\n")
 
 def read_data_csv(data_file, data_fields=None, delimiter=','):
     """ Read data from a CSV file.
@@ -80,12 +187,15 @@ def read_data_csv(data_file, data_fields=None, delimiter=','):
     dict of Numpy arrays.
     """
     data = pd.read_csv(data_file, delimiter=delimiter)
+    assert data.shape[0] > 0, \
+        f"{data_file} has an empty data. The data frame shape is {data.shape}"
+
     if data_fields is not None:
         for field in data_fields:
             assert field in data, f"The data field {field} does not exist in the data file."
-        return {field: data[field] for field in data_fields}
+        return {field: data[field].to_numpy() for field in data_fields}
     else:
-        return data
+        return {field: data[field].to_numpy() for field in data}
 
 def write_data_csv(data, data_file, delimiter=','):
     """ Write data to a CSV file.
@@ -101,6 +211,13 @@ def write_data_csv(data, data_file, delimiter=','):
     """
     data_frame = pd.DataFrame(data)
     data_frame.to_csv(data_file, index=True, sep=delimiter)
+
+def _pad_stack(arrs):
+    max_len = max(len(arr) for arr in arrs)
+    new_arrs = np.zeros((len(arrs), max_len), dtype=arrs[0].dtype)
+    for i, arr in enumerate(arrs):
+        new_arrs[i][:len(arr)] = arr
+    return new_arrs
 
 def read_data_json(data_file, data_fields):
     """ Read data from a JSON file.
@@ -125,15 +242,21 @@ def read_data_json(data_file, data_fields):
         for line in json_file.readlines():
             record = json.loads(line)
             data_records.append(record)
+    assert len(data_records) > 0, \
+        f"{data_file} is empty {data_records}."
 
     data = {key: [] for key in data_fields}
     for record in data_records:
         for key in data_fields:
             assert key in record, \
                     f"The data field {key} does not exist in the record {record} of {data_file}."
-            data[key].append(record[key])
+            record1 = np.array(record[key]) if isinstance(record[key], list) else record[key]
+            data[key].append(record1)
     for key in data:
-        data[key] = np.array(data[key])
+        if isinstance(data[key][0], np.ndarray):
+            data[key] = _pad_stack(data[key])
+        else:
+            data[key] = np.array(data[key])
     return data
 
 def write_data_json(data, data_file):
@@ -144,12 +267,22 @@ def write_data_json(data, data_file):
         if len(records) == 0:
             records = [{} for _ in range(len(data[key]))]
         assert len(records) == len(data[key])
-        if data[key].shape == 1:
-            for i, val in enumerate(data[key]):
-                records[i][key] = val
+        if isinstance(data[key], np.ndarray):
+            if data[key].shape == 1:
+                for i, val in enumerate(data[key]):
+                    records[i][key] = val
+            else:
+                for i, val in enumerate(data[key]):
+                    records[i][key] = val.tolist()
+        elif isinstance(data[key], list):
+            if isinstance(data[key][0], np.ndarray):
+                for i, val in enumerate(data[key]):
+                    records[i][key] = val.tolist()
+            else:
+                for i, val in enumerate(data[key]):
+                    records[i][key] = val
         else:
-            for i, val in enumerate(data[key]):
-                records[i][key] = val.tolist()
+            raise ValueError("Invalid data.")
     with open(data_file, 'w', encoding="utf8") as json_file:
         for record in records:
             record = json.dumps(record)
@@ -175,18 +308,30 @@ def read_data_parquet(data_file, data_fields=None):
     table = pq.read_table(data_file)
     data = {}
     df_table = table.to_pandas()
+    assert df_table.shape[0] > 0, \
+        f"{data_file} has an empty data. The data frame shape is {df_table.shape}"
+
     if data_fields is None:
         data_fields = list(df_table.keys())
     for key in data_fields:
         assert key in df_table, f"The data field {key} does not exist in {data_file}."
-        val = df_table[key]
-        d = np.array(val)
+        d = df_table[key].to_numpy()
+
         # For multi-dimension arrays, we split them by rows and
         # save them as objects in parquet. We need to merge them
         # together and store them in a tensor.
         if d.dtype.hasobject and isinstance(d[0], np.ndarray):
-            d = [d[i] for i in range(len(d))]
-            d = np.stack(d)
+            new_d = [d[i] for i in range(len(d))]
+            try:
+                # if each row has the same shape
+                # merge them together
+                d = np.stack(new_d)
+            except Exception: # pylint: disable=broad-exception-caught
+                # keep it as an ndarry of ndarrys
+                # It may happen when loading hard negatives for hard negative transformation.
+                logging.warning("The %s column of parquet file %s has " \
+                    "variable length of feature, it is only suported when " \
+                    "transformation is a hard negative transformation", key, data_file)
         data[key] = d
     return data
 
@@ -245,15 +390,45 @@ def read_data_hdf5(data_file, data_fields=None, in_mem=True):
         data[name] = f[name][:] if in_mem else HDF5Array(f[name], handle)
     return data
 
+def stream_dist_tensors_to_hdf5(data, data_file, chunk_size=100000):
+    """ Stream write dict of dist tensor into a HDF5 file.
+
+    Parameters
+    ----------
+    data : dict of dist tensor
+        The data to be saved to the hdf5 file.
+    data_file : str
+        The file name of the hdf5 file.
+    chunk_size : int
+        The size of a chunk to extract from dist tensor.
+    """
+    chunk_size = 100000
+    with h5py.File(data_file, "w") as f:
+        for key, val in data.items():
+            arr = f.create_dataset(key, val.shape, dtype=np.array(val[0]).dtype)
+            if len(val) > chunk_size:
+                num_chunks = len(val) // chunk_size
+                remainder = len(val) % chunk_size
+                for i in range(num_chunks):
+                    # extract a chunk from dist tensor
+                    chunk_val = np.array(val[i*chunk_size:(i+1)*chunk_size])
+                    arr[i*chunk_size:(i+1)*chunk_size] = chunk_val
+                # need to write remainder
+                if remainder != 0:
+                    remainder_val = np.array(val[num_chunks*chunk_size:len(val)])
+                    arr[num_chunks*chunk_size:] = remainder_val
+            else:
+                arr[:] = np.array(val[0:len(val)])
+
 def write_data_hdf5(data, data_file):
     """ Write data into a HDF5 file.
 
     Parameters
     ----------
     data : dict
-        The data to be saved to the Parquet file.
+        The data to be saved to the hdf5 file.
     data_file : str
-        The file name of the Parquet file.
+        The file name of the hdf5 file.
     """
     with h5py.File(data_file, "w") as f:
         for key, val in data.items():
@@ -289,11 +464,20 @@ def _parse_file_format(conf, is_node, in_mem):
     if "features" in conf:
         for feat_conf in conf["features"]:
             assert "feature_col" in feat_conf, "A feature config needs a feature_col."
-            keys.append(feat_conf["feature_col"])
+            if isinstance(feat_conf["feature_col"], str):
+                keys.append(feat_conf["feature_col"])
+            elif isinstance(feat_conf["feature_col"], list):
+                for feat_key in feat_conf["feature_col"]:
+                    keys.append(feat_key)
+            else:
+                raise TypeError("Feature column must be a str or a list of string.")
     if "labels" in conf:
         for label_conf in conf["labels"]:
             if "label_col" in label_conf:
                 keys.append(label_conf["label_col"])
+
+    # We need to remove duplicated keys to avoid retrieve the same data multiple times.
+    keys = list(set(keys))
     if fmt["name"] == "parquet":
         return partial(read_data_parquet, data_fields=keys)
     elif fmt["name"] == "json":
@@ -301,7 +485,7 @@ def _parse_file_format(conf, is_node, in_mem):
     elif fmt["name"] == "hdf5":
         return partial(read_data_hdf5, data_fields=keys, in_mem=in_mem)
     elif fmt["name"] == "csv":
-        delimiter = fmt["delimiter"] if "delimiter" in fmt else ","
+        delimiter = fmt["separator"] if "separator" in fmt else ","
         return partial(read_data_csv, data_fields=keys, delimiter=delimiter)
     else:
         raise ValueError('Unknown file format: {}'.format(fmt['name']))
@@ -309,7 +493,7 @@ def _parse_file_format(conf, is_node, in_mem):
 parse_node_file_format = partial(_parse_file_format, is_node=True)
 parse_edge_file_format = partial(_parse_file_format, is_node=False)
 
-def get_in_files(in_files):
+def get_in_files(in_files: Union[List[str], str]) -> List[str]:
     """ Get the input files.
 
     The input file string may contains a wildcard. This function
@@ -324,12 +508,11 @@ def get_in_files(in_files):
     -------
     a list of str : the full name of input files.
     """
-    # If the input file has a wildcard, get all files that matches the input file name.
-    if '*' in in_files:
-        in_files = glob.glob(in_files)
-    # This is a single file.
-    elif not isinstance(in_files, list):
+    # Convert single str to list of str if needed
+    if isinstance(in_files, str):
         in_files = [in_files]
+
+    in_files = expand_wildcard(in_files)
 
     # Verify the existence of the input files.
     for in_file in in_files:

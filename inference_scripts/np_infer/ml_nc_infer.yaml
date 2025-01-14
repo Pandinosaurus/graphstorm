@@ -17,7 +17,6 @@ gsf:
     save_embed_path: /data/gsgnn_nc_ml/infer-emb/
     save_prediction_path: /data/gsgnn_nc_ml/prediction/
   hyperparam:
-    bert_infer_bs: 128
     no_validation: false
   rgcn:
     num_bases: -1
@@ -26,6 +25,6 @@ gsf:
     use_node_embeddings: false
   node_classification:
     target_ntype: "movie"
-    label_field: "genre"
+    label_field: "label"
     multilabel: false
     num_classes: 19

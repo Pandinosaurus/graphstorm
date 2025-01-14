@@ -15,13 +15,35 @@
 """
 import os
 import tempfile
+import json
 
+import dgl
 import numpy as np
+import pytest
+import pandas as pd
+import pyarrow.parquet as pq
+import pyarrow as pa
 import torch as th
+
+from numpy.testing import assert_almost_equal
 
 from graphstorm.gconstruct.utils import _estimate_sizeof, _to_numpy_array, _to_shared_memory
 from graphstorm.gconstruct.utils import HDF5Array, ExtNumpyWrapper
-from graphstorm.gconstruct.file_io import write_data_hdf5, read_data_hdf5
+from graphstorm.gconstruct.utils import convert_to_ext_mem_numpy, _to_ext_memory
+from graphstorm.gconstruct.utils import multiprocessing_data_read
+from graphstorm.gconstruct.utils import (save_maps,
+                                         load_maps,
+                                         get_hard_edge_negs_feats,
+                                         shuffle_hard_nids)
+from graphstorm.gconstruct.file_io import (write_data_hdf5,
+                                           read_data_hdf5,
+                                           get_in_files,
+                                           write_data_parquet)
+from graphstorm.gconstruct.file_io import read_index, write_index_json, expand_wildcard
+from graphstorm.gconstruct.file_io import (read_data_csv,
+                                           read_data_json,
+                                           read_data_parquet)
+from graphstorm.gconstruct.transform import HardEdgeDstNegativeTransform
 
 def gen_data():
     data_th = th.zeros((1024, 16), dtype=th.float32)
@@ -164,16 +186,348 @@ def test_ext_mem_array():
     with tempfile.TemporaryDirectory() as tmpdirname:
         data = np.random.uniform(size=(1000, 10)).astype(np.float32)
         tensor_path = os.path.join(tmpdirname, "tmp1.npy")
-        out_arr = np.memmap(tensor_path, np.float32, mode="w+", shape=(1000, 10))
-        out_arr[:] = data
-        check_ext_mem_array(ExtNumpyWrapper(tensor_path, out_arr.shape, out_arr.dtype), data)
+        check_ext_mem_array(convert_to_ext_mem_numpy(tensor_path, data), data)
+
+        data1 = np.random.uniform(size=(1000, 10)).astype(np.float32)
+        data2 = np.random.uniform(size=(1000,)).astype(np.float32)
+        data3 = np.random.uniform(size=(1000, 10)).astype(np.float32)
+        data4 = np.random.uniform(size=(1000,)).astype(np.float32)
+        data5 = np.random.uniform(size=(1000,)).astype(str)
+        arr_dict = {
+                "test1": (data1, data2),
+                "test2": [data3, data4, data5],
+        }
+        arr_dict1 = _to_ext_memory(None, arr_dict, tmpdirname)
+        assert isinstance(arr_dict1, dict)
+        assert "test1" in arr_dict1
+        assert "test2" in arr_dict1
+        assert isinstance(arr_dict1["test1"], tuple)
+        assert isinstance(arr_dict1["test2"], list)
+        assert isinstance(arr_dict1["test1"][0], ExtNumpyWrapper)
+        assert isinstance(arr_dict1["test1"][1], ExtNumpyWrapper)
+        assert isinstance(arr_dict1["test2"][0], ExtNumpyWrapper)
+        assert isinstance(arr_dict1["test2"][1], ExtNumpyWrapper)
+        assert isinstance(arr_dict1["test2"][2], np.ndarray)
+        assert np.all(arr_dict1["test1"][0].to_numpy() == data1)
+        assert np.all(arr_dict1["test1"][1].to_numpy() == data2)
+        assert np.all(arr_dict1["test2"][0].to_numpy() == data3)
+        assert np.all(arr_dict1["test2"][1].to_numpy() == data4)
 
         tensor_path = os.path.join(tmpdirname, "tmp2.hdf5")
         write_data_hdf5({"test": data}, tensor_path)
         data1 = read_data_hdf5(tensor_path, in_mem=False)
         check_ext_mem_array(data1['test'], data)
 
+def dummy_read(in_file):
+    assert False
+
+def test_multiprocessing_read():
+    try:
+        multiprocessing_data_read([str(i) for i in range(10)], 2, dummy_read)
+    except RuntimeError as e:
+        print(e)
+        return
+    assert False
+
+def test_read_empty_parquet():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        data_file = os.path.join(tmpdirname, "test.parquet")
+        fields = ["a", "b"]
+        empty_df = pd.DataFrame(columns=fields)
+        empty_table = pa.Table.from_pandas(empty_df)
+        pq.write_table(empty_table, data_file)
+
+        pass_test = False
+        try:
+            read_data_parquet(data_file, fields)
+        except:
+            pass_test = True
+        assert pass_test
+
+def test_read_empty_csv():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        data_file = os.path.join(tmpdirname, "test.parquet")
+        fields = ["a", "b"]
+        empty_df = pd.DataFrame(columns=fields)
+        empty_df.to_csv(data_file, index=True, sep=",")
+
+        pass_test = False
+        try:
+            read_data_csv(data_file, fields, ",")
+        except:
+            pass_test = True
+        assert pass_test
+
+def test_read_empty_json():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        data_file = os.path.join(tmpdirname, "test.json")
+        data = {}
+        with open(data_file, 'w', encoding="utf8") as json_file:
+            json.dump(data, json_file)
+
+        pass_test = False
+        try:
+            read_data_json(data_file)
+        except:
+            pass_test = True
+        assert pass_test
+
+def test_read_empty_parquet():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        data_file = os.path.join(tmpdirname, "test.parquet")
+        fields = ["a", "b"]
+        empty_df = pd.DataFrame(columns=fields)
+        empty_table = pa.Table.from_pandas(empty_df)
+        pq.write_table(empty_table, data_file)
+
+        pass_test = False
+        try:
+            read_data_parquet(data_file, fields)
+        except:
+            pass_test = True
+        assert pass_test
+
+def test_get_in_files():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        files = [os.path.join(tmpdirname, f"test{i}.parquet") for i in range(10)]
+        for i in range(10):
+            data = {"test": np.random.rand(10)}
+            write_data_parquet(data, files[i])
+        files.sort()
+
+        # Test single string wildcard path
+        in_files = get_in_files(os.path.join(tmpdirname,"*.parquet"))
+        assert len(in_files) == 10
+
+        assert files == in_files
+
+        # Test list of wildcard paths with a single element
+        in_files = get_in_files([os.path.join(tmpdirname, "*.parquet")])
+        assert len(in_files) == 10
+        assert files == in_files
+
+        in_files = get_in_files(os.path.join(tmpdirname,"test9.parquet"))
+        assert len(in_files) == 1
+        assert os.path.join(tmpdirname,"test9.parquet") == in_files[0]
+
+        with pytest.raises(AssertionError):
+            in_files = get_in_files(os.path.join(tmpdirname,"test10.parquet"))
+
+def test_get_hard_edge_negs_feats():
+    hard_trans0 = HardEdgeDstNegativeTransform("hard_neg", "hard_neg")
+    hard_trans0.set_target_etype(("src", "rel0", "dst"))
+
+    hard_trans1 = HardEdgeDstNegativeTransform("hard_neg", "hard_neg1")
+    hard_trans1.set_target_etype(("src", "rel0", "dst"))
+
+    hard_trans2 = HardEdgeDstNegativeTransform("hard_neg", "hard_neg")
+    hard_trans2.set_target_etype(("src", "rel1", "dst"))
+
+    hard_edge_neg_feats = get_hard_edge_negs_feats([hard_trans0, hard_trans1, hard_trans2])
+    assert len(hard_edge_neg_feats) == 2
+    assert len(hard_edge_neg_feats[("src", "rel0", "dst")]) == 1
+    assert len(hard_edge_neg_feats[("src", "rel0", "dst")]["dst"]) == 2
+    assert set(hard_edge_neg_feats[("src", "rel0", "dst")]["dst"]) == set(["hard_neg", "hard_neg1"])
+    assert len(hard_edge_neg_feats[("src", "rel1", "dst")]) == 1
+    assert len(hard_edge_neg_feats[("src", "rel1", "dst")]["dst"]) == 1
+
+def test_save_load_maps():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        map_data = {"a": th.randint(100, (10,)),
+                    "b": th.randint(100, (10,))}
+        save_maps(tmpdirname, "node_mapping", map_data)
+        node_mapping = load_maps(tmpdirname, "node_mapping")
+        assert_almost_equal(node_mapping["a"].numpy(), map_data["a"].numpy())
+        assert_almost_equal(node_mapping["b"].numpy(), map_data["b"].numpy())
+
+def test_shuffle_hard_nids():
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        num_parts = 2
+        # generate node_mapping
+        node_mapping = {
+            "dst0" : 99 - th.arange(100),
+            "dst1" : 199 - th.arange(200)
+        }
+        save_maps(tmpdirname, "node_mapping", node_mapping)
+
+        reverse_map_dst0 = {gid: i for i, gid in enumerate(node_mapping["dst0"].tolist())}
+        reverse_map_dst0[-1] = -1
+        reverse_map_dst1 = {gid: i for i, gid in enumerate(node_mapping["dst1"].tolist())}
+        reverse_map_dst1[-1] = -1
+
+        static_feat = th.rand((100, 10))
+        # generate edge features
+        etype0 = ("src", "rel0", "dst0")
+        etype1 = ("src", "rel0", "dst1")
+        p0_etype0_neg0 = th.randint(100, (100, 5))
+        p0_etype0_neg1 = th.randint(100, (100, 10))
+        p0_etype1_neg0 = th.randint(100, (100, 5))
+
+        p0_etype0_neg0_shuffled = [
+            [reverse_map_dst0[nid] for nid in negs] \
+                for negs in p0_etype0_neg0.tolist()]
+        p0_etype0_neg0_shuffled = np.array(p0_etype0_neg0_shuffled)
+        p0_etype0_neg1_shuffled = [
+            [reverse_map_dst0[nid] for nid in negs] \
+                for negs in p0_etype0_neg1.tolist()]
+        p0_etype0_neg1_shuffled = np.array(p0_etype0_neg1_shuffled)
+
+        p0_etype1_neg0_shuffled = [
+            [reverse_map_dst1[nid] for nid in negs] \
+                for negs in p0_etype1_neg0.tolist()]
+        p0_etype1_neg0_shuffled = np.array(p0_etype1_neg0_shuffled)
+
+        edge_feats_part0 = {
+            ":".join(etype0)+"/static_feat": static_feat,
+            ":".join(etype0)+"/hard_neg0": p0_etype0_neg0,
+            ":".join(etype0)+"/hard_neg1": p0_etype0_neg1,
+            ":".join(etype1)+"/hard_neg0": p0_etype1_neg0
+        }
+        part_path = os.path.join(tmpdirname, f"part{0}")
+        os.mkdir(part_path)
+        edge_feat_path = os.path.join(part_path, "edge_feat.dgl")
+        dgl.data.utils.save_tensors(edge_feat_path, edge_feats_part0)
+
+
+        p1_etype0_neg0 = th.randint(100, (100, 5))
+        p1_etype0_neg1 = th.randint(100, (100, 10))
+        p1_etype1_neg0 = th.randint(100, (100, 5))
+        p1_etype0_neg1[:,-2:] = -1
+        p1_etype1_neg0[0][-1] = -1
+
+        p1_etype0_neg0_shuffled = [
+            [reverse_map_dst0[nid] for nid in negs] \
+                for negs in p1_etype0_neg0.tolist()]
+        p1_etype0_neg0_shuffled = np.array(p1_etype0_neg0_shuffled)
+
+        p1_etype0_neg1_shuffled = [
+            [reverse_map_dst0[nid] for nid in negs ] \
+                for negs in p1_etype0_neg1.tolist()]
+        p1_etype0_neg1_shuffled = np.array(p1_etype0_neg1_shuffled)
+
+        p1_etype1_neg0_shuffled = [
+            [reverse_map_dst1[nid] for nid in negs] \
+                for negs in p1_etype1_neg0.tolist()]
+        p1_etype1_neg0_shuffled = np.array(p1_etype1_neg0_shuffled)
+
+        edge_feats_part1 = {
+            ":".join(etype0)+"/static_feat": static_feat,
+            ":".join(etype0)+"/hard_neg0": p1_etype0_neg0,
+            ":".join(etype0)+"/hard_neg1": p1_etype0_neg1,
+            ":".join(etype1)+"/hard_neg0": p1_etype1_neg0
+        }
+
+        part_path = os.path.join(tmpdirname, f"part{1}")
+        os.mkdir(part_path)
+        edge_feat_path = os.path.join(part_path, "edge_feat.dgl")
+        dgl.data.utils.save_tensors(edge_feat_path, edge_feats_part1)
+
+        hard_edge_neg_feats = {
+            etype0: {"dst0": ["hard_neg0", "hard_neg1"]},
+            etype1: {"dst1": ["hard_neg0"]}
+        }
+        # test
+        shuffle_hard_nids(tmpdirname, 2, hard_edge_neg_feats)
+
+        part_path = os.path.join(tmpdirname, f"part{0}")
+        edge_feat_path = os.path.join(part_path, "edge_feat.dgl")
+        p0_new_edge_feats = dgl.data.utils.load_tensors(edge_feat_path)
+
+        assert_almost_equal(p0_new_edge_feats[":".join(etype0)+"/static_feat"].numpy(),
+                            static_feat.numpy())
+        assert_almost_equal(p0_new_edge_feats[":".join(etype0)+"/hard_neg0"].numpy(),
+                            p0_etype0_neg0_shuffled)
+        assert_almost_equal(p0_new_edge_feats[":".join(etype0)+"/hard_neg1"].numpy(),
+                            p0_etype0_neg1_shuffled)
+        assert_almost_equal(p0_new_edge_feats[":".join(etype1)+"/hard_neg0"].numpy(),
+                            p0_etype1_neg0_shuffled)
+
+        part_path = os.path.join(tmpdirname, f"part{1}")
+        edge_feat_path = os.path.join(part_path, "edge_feat.dgl")
+        p1_new_edge_feats = dgl.data.utils.load_tensors(edge_feat_path)
+        assert_almost_equal(p1_new_edge_feats[":".join(etype0)+"/static_feat"].numpy(),
+                            static_feat.numpy())
+        assert_almost_equal(p1_new_edge_feats[":".join(etype0)+"/hard_neg0"].numpy(),
+                            p1_etype0_neg0_shuffled)
+        assert_almost_equal(p1_new_edge_feats[":".join(etype0)+"/hard_neg1"].numpy(),
+                            p1_etype0_neg1_shuffled)
+        assert_almost_equal(p1_new_edge_feats[":".join(etype1)+"/hard_neg0"].numpy(),
+                            p1_etype1_neg0_shuffled)
+
+
+def test_read_index():
+    write_index_json([(3, 3)], "/tmp/test_idx.json")
+    split_info = {"valid": "/tmp/test_idx.json"}
+    _, json_content, _ = read_index(split_info)
+    assert json_content == [(3, 3)]
+
+    write_index_json(np.arange(3), "/tmp/test_idx.json")
+    split_info = {"train": "/tmp/test_idx.json"}
+    json_content, _, _ = read_index(split_info)
+    assert json_content == [0, 1, 2]
+
+    data = ["p70", "p71", "p72", "p73", "p74", "p75"]
+    df = pd.DataFrame(data, columns=['ID'])
+    df.to_parquet('/tmp/test_idx.parquet')
+    split_info = {"train": "/tmp/test_idx.parquet", "column": ["ID"]}
+    parquet_content, _, _ = read_index(split_info)
+    assert np.array_equal(parquet_content, data)
+
+    data_multi = ["p702", "p712", "p722", "p732", "p742", "p752"]
+    df = pd.DataFrame(data_multi, columns=['ID'])
+    # test with wildcard
+    df.to_parquet('/tmp/test_idx_multi.parquet')
+    split_info = {"train": "/tmp/test_idx*.parquet", "column": ["ID"]}
+    parquet_content, _, _ = read_index(split_info)
+    assert np.array_equal(parquet_content, data + data_multi)
+    # test with list input
+    split_info = {"train": ["/tmp/test_idx.parquet", "/tmp/test_idx_multi.parquet"],
+                  "column": ["ID"]}
+    parquet_content, _, _ = read_index(split_info)
+    assert np.array_equal(parquet_content, data + data_multi)
+
+    data, data2 = ["p1", "p2"], ["p3", "p4"]
+    df = pd.DataFrame({'src': data, 'dst': data2})
+    df.to_parquet('/tmp/train_idx.parquet')
+    split_info = {"train": "/tmp/train_idx.parquet", "column": ["src", "dst"]}
+    parquet_content, _, _ = read_index(split_info)
+    assert parquet_content == [("p1", "p3"), ("p2", "p4")]
+
+    data3, data4 = ["p5", "p6"], ["p7", "p8"]
+    df = pd.DataFrame({'src': data3, 'dst': data4})
+    df.to_parquet('/tmp/test_idx.parquet')
+    split_info = {"train": "/tmp/train_idx.parquet",
+                  "test": "/tmp/test_idx.parquet", "column": ["src", "dst"]}
+    train_content, _, test_content = read_index(split_info)
+    assert train_content == [("p1", "p3"), ("p2", "p4")]
+    assert test_content == [("p5", "p7"), ("p6", "p8")]
+
+def test_single_directory_expansion():
+    # Create a temporary directory
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create some test files in the directory
+        test_files = ['file1.txt', 'file2.txt']
+        for file_name in test_files:
+            with open(os.path.join(temp_dir, file_name), 'w') as f:
+                f.write('test')
+
+        # Test the function with a single directory
+        result = expand_wildcard([temp_dir])
+
+        # Sort both lists for comparison
+        expected_files = sorted([os.path.join(temp_dir, f) for f in test_files])
+        assert sorted(result) == expected_files
+
 if __name__ == '__main__':
+    test_shuffle_hard_nids()
+    test_save_load_maps()
+    test_get_hard_edge_negs_feats()
+    test_get_in_files()
+    test_read_empty_parquet()
+    test_read_empty_json()
+    test_read_empty_csv()
     test_estimate_sizeof()
     test_object_conversion()
     test_ext_mem_array()
+    test_multiprocessing_read()
+    test_read_index()

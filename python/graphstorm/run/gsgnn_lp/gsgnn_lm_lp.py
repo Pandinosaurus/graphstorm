@@ -15,32 +15,17 @@
 
     GSgnn pure gpu link prediction.
 """
-
 import os
-import torch as th
+import logging
+
 import graphstorm as gs
 from graphstorm.config import get_argument_parser
 from graphstorm.config import GSConfig
 from graphstorm.trainer import GSgnnLinkPredictionTrainer
-from graphstorm.dataloading import GSgnnEdgeTrainData
-from graphstorm.dataloading import GSgnnLinkPredictionDataLoader
-from graphstorm.dataloading import GSgnnLPJointNegDataLoader
-from graphstorm.dataloading import GSgnnLPLocalUniformNegDataLoader
-from graphstorm.dataloading import GSgnnLPLocalJointNegDataLoader
-from graphstorm.dataloading import GSgnnAllEtypeLPJointNegDataLoader
-from graphstorm.dataloading import GSgnnAllEtypeLinkPredictionDataLoader
-from graphstorm.dataloading import GSgnnLinkPredictionTestDataLoader
-from graphstorm.dataloading import GSgnnLinkPredictionJointTestDataLoader
-from graphstorm.dataloading import BUILTIN_LP_UNIFORM_NEG_SAMPLER
-from graphstorm.dataloading import BUILTIN_LP_JOINT_NEG_SAMPLER
-from graphstorm.dataloading import BUILTIN_LP_LOCALUNIFORM_NEG_SAMPLER
-from graphstorm.dataloading import BUILTIN_LP_LOCALJOINT_NEG_SAMPLER
-from graphstorm.dataloading import BUILTIN_LP_ALL_ETYPE_UNIFORM_NEG_SAMPLER
-from graphstorm.dataloading import BUILTIN_LP_ALL_ETYPE_JOINT_NEG_SAMPLER
-from graphstorm.eval import GSgnnMrrLPEvaluator
-from graphstorm.model.utils import save_embeddings
+from graphstorm.dataloading import GSgnnData
+from graphstorm.model.utils import save_full_node_embeddings
 from graphstorm.model import do_full_graph_inference
-from graphstorm.utils import rt_profiler, sys_tracker
+from graphstorm.utils import rt_profiler, sys_tracker, get_device
 
 def main(config_args):
     """ main function
@@ -48,77 +33,84 @@ def main(config_args):
     config = GSConfig(config_args)
     config.verify_arguments(True)
 
-    gs.initialize(ip_config=config.ip_config, backend=config.backend)
+    gs.initialize(ip_config=config.ip_config, backend=config.backend,
+                  local_rank=config.local_rank, use_graphbolt=config.use_graphbolt)
     rt_profiler.init(config.profile_path, rank=gs.get_rank())
     sys_tracker.init(config.verbose, rank=gs.get_rank())
-    train_data = GSgnnEdgeTrainData(config.graph_name,
-                                    config.part_config,
-                                    train_etypes=config.train_etype,
-                                    eval_etypes=config.eval_etype,
-                                    node_feat_field=config.node_feat_name)
+    # The model only uses language model(s) as its encoder
+    # It will not use node or edge features
+    # except LM related features.
+    train_data = GSgnnData(config.part_config)
     model = gs.create_builtin_lp_model(train_data.g, config, train_task=True)
-    trainer = GSgnnLinkPredictionTrainer(model, gs.get_rank(),
-                                         topk_model_to_save=config.topk_model_to_save)
+    trainer = GSgnnLinkPredictionTrainer(model, topk_model_to_save=config.topk_model_to_save)
     if config.restore_model_path is not None:
         trainer.restore_model(model_path=config.restore_model_path,
                               model_layer_to_load=config.restore_model_layers)
-    trainer.setup_cuda(dev_id=config.local_rank)
+    trainer.setup_device(device=get_device())
     if not config.no_validation:
         # TODO(zhengda) we need to refactor the evaluator.
-        trainer.setup_evaluator(
-            GSgnnMrrLPEvaluator(config.eval_frequency,
-                                train_data,
-                                config.num_negative_edges_eval,
-                                config.lp_decoder_type,
-                                config.use_early_stop,
-                                config.early_stop_burnin_rounds,
-                                config.early_stop_rounds,
-                                config.early_stop_strategy))
-        assert len(train_data.val_idxs) > 0, "The training data do not have validation set."
+        # Currently, we only support mrr
+        evaluator = gs.create_lp_evaluator(config)
+        trainer.setup_evaluator(evaluator)
+        val_idxs = train_data.get_edge_val_set(config.eval_etype)
+        assert len(val_idxs) > 0, "The training data do not have validation set."
         # TODO(zhengda) we need to compute the size of the entire validation set to make sure
         # we have validation data.
-    tracker = gs.create_builtin_task_tracker(config, trainer.rank)
-    if trainer.rank == 0:
+    tracker = gs.create_builtin_task_tracker(config)
+    if gs.get_rank() == 0:
         tracker.log_params(config.__dict__)
     trainer.setup_task_tracker(tracker)
 
-    if config.train_negative_sampler == BUILTIN_LP_UNIFORM_NEG_SAMPLER:
-        dataloader_cls = GSgnnLinkPredictionDataLoader
-    elif config.train_negative_sampler == BUILTIN_LP_JOINT_NEG_SAMPLER:
-        dataloader_cls = GSgnnLPJointNegDataLoader
-    elif config.train_negative_sampler == BUILTIN_LP_LOCALUNIFORM_NEG_SAMPLER:
-        dataloader_cls = GSgnnLPLocalUniformNegDataLoader
-    elif config.train_negative_sampler == BUILTIN_LP_LOCALJOINT_NEG_SAMPLER:
-        dataloader_cls = GSgnnLPLocalJointNegDataLoader
-    elif config.train_negative_sampler == BUILTIN_LP_ALL_ETYPE_UNIFORM_NEG_SAMPLER:
-        dataloader_cls = GSgnnAllEtypeLinkPredictionDataLoader
-    elif config.train_negative_sampler == BUILTIN_LP_ALL_ETYPE_JOINT_NEG_SAMPLER:
-        dataloader_cls = GSgnnAllEtypeLPJointNegDataLoader
-    else:
-        raise ValueError('Unknown negative sampler')
-    device = 'cuda:%d' % trainer.dev_id
-    dataloader = dataloader_cls(train_data, train_data.train_idxs, [],
-                                config.batch_size, config.num_negative_edges, device,
+    dataloader_cls = gs.get_builtin_lp_train_dataloader_class(config)
+    train_idxs = train_data.get_edge_train_set(config.train_etype)
+    dataloader = dataloader_cls(train_data,
+                                train_idxs, [],
+                                config.batch_size, config.num_negative_edges,
+                                node_feats=config.node_feat_name,
+                                edge_feats=config.edge_feat_name,
+                                pos_graph_edge_feats=config.lp_edge_weight_for_loss,
                                 train_task=True,
-                                lp_edge_weight_for_loss=config.lp_edge_weight_for_loss)
+                                edge_dst_negative_field=config.train_etypes_negative_dstnode,
+                                num_hard_negs=config.num_train_hard_negatives)
 
     # TODO(zhengda) let's use full-graph inference for now.
-    if config.eval_negative_sampler == BUILTIN_LP_UNIFORM_NEG_SAMPLER:
-        test_dataloader_cls = GSgnnLinkPredictionTestDataLoader
-    elif config.eval_negative_sampler == BUILTIN_LP_JOINT_NEG_SAMPLER:
-        test_dataloader_cls = GSgnnLinkPredictionJointTestDataLoader
-    else:
-        raise ValueError('Unknown test negative sampler.'
-            'Supported test negative samplers include '
-            f'[{BUILTIN_LP_UNIFORM_NEG_SAMPLER}, {BUILTIN_LP_JOINT_NEG_SAMPLER}]')
+    test_dataloader_cls = gs.get_builtin_lp_eval_dataloader_class(config)
     val_dataloader = None
     test_dataloader = None
-    if len(train_data.val_idxs) > 0:
-        val_dataloader = test_dataloader_cls(train_data, train_data.val_idxs,
-            config.eval_batch_size, config.num_negative_edges_eval)
-    if len(train_data.test_idxs) > 0:
-        test_dataloader = test_dataloader_cls(train_data, train_data.test_idxs,
-            config.eval_batch_size, config.num_negative_edges_eval)
+
+    val_idxs = train_data.get_edge_val_set(config.eval_etype)
+    if len(val_idxs) > 0:
+        if config.eval_etypes_negative_dstnode is not None:
+            val_dataloader = test_dataloader_cls(train_data, val_idxs,
+                config.eval_batch_size,
+                config.eval_etypes_negative_dstnode,
+                node_feats=config.node_feat_name,
+                edge_feats=config.edge_feat_name,
+                pos_graph_edge_feats=config.lp_edge_weight_for_loss)
+        else:
+            val_dataloader = test_dataloader_cls(train_data, val_idxs,
+                config.eval_batch_size,
+                config.num_negative_edges_eval,
+                node_feats=config.node_feat_name,
+                edge_feats=config.edge_feat_name,
+                pos_graph_edge_feats=config.lp_edge_weight_for_loss)
+
+    test_idxs = train_data.get_edge_test_set(config.eval_etype)
+    if len(test_idxs) > 0:
+        if config.eval_etypes_negative_dstnode is not None:
+            test_dataloader = test_dataloader_cls(train_data, test_idxs,
+                config.eval_batch_size,
+                config.eval_etypes_negative_dstnode,
+                node_feats=config.node_feat_name,
+                edge_feats=config.edge_feat_name,
+                pos_graph_edge_feats=config.lp_edge_weight_for_loss)
+        else:
+            test_dataloader = test_dataloader_cls(train_data, test_idxs,
+                config.eval_batch_size,
+                config.num_negative_edges_eval,
+                node_feats=config.node_feat_name,
+                edge_feats=config.edge_feat_name,
+                pos_graph_edge_feats=config.lp_edge_weight_for_loss)
 
     # Preparing input layer for training or inference.
     # The input layer can pre-compute node features in the preparing step if needed.
@@ -136,13 +128,21 @@ def main(config_args):
                 save_model_path=save_model_path,
                 use_mini_batch_infer=config.use_mini_batch_infer,
                 save_model_frequency=config.save_model_frequency,
-                save_perf_results_path=config.save_perf_results_path)
+                save_perf_results_path=config.save_perf_results_path,
+                max_grad_norm=config.max_grad_norm,
+                grad_norm_type=config.grad_norm_type)
 
     if config.save_embed_path is not None:
+        assert config.edge_feat_name is None, 'GraphStorm node prediction training command ' + \
+            'uses full-graph inference by default to generate node embeddings at the end of ' + \
+            'training. But the full-graph inference method does not support edge features ' + \
+            'in the current version. Please set the \"save_embed_path\" to none ' + \
+            ' if you want to use edge features in training command.'
         model = gs.create_builtin_lp_model(train_data.g, config, train_task=False)
         best_model_path = trainer.get_best_model_path()
         # TODO(zhengda) the model path has to be in a shared filesystem.
         model.restore_model(best_model_path)
+        model = model.to(get_device())
         # Preparing input layer for training or inference.
         # The input layer can pre-compute node features in the preparing step if needed.
         # For example pre-compute all BERT embeddings
@@ -150,10 +150,12 @@ def main(config_args):
         # TODO(zhengda) we may not want to only use training edges to generate GNN embeddings.
         embeddings = do_full_graph_inference(model, train_data, fanout=config.eval_fanout,
                                              edge_mask="train_mask", task_tracker=tracker)
-        save_embeddings(config.save_embed_path, embeddings, gs.get_rank(),
-                        th.distributed.get_world_size(),
-                        device=device,
-                        node_id_mapping_file=config.node_id_mapping_file)
+        save_full_node_embeddings(
+            train_data.g,
+            config.save_embed_path,
+            embeddings,
+            node_id_mapping_file=config.node_id_mapping_file,
+            save_embed_format=config.save_embed_format)
 
 def generate_parser():
     """ Generate an argument parser
@@ -164,6 +166,9 @@ def generate_parser():
 if __name__ == '__main__':
     arg_parser=generate_parser()
 
-    args = arg_parser.parse_args()
-    print(args)
-    main(args)
+    # Ignore unknown args to make script more robust to input arguments
+    gs_args, unknown_args = arg_parser.parse_known_args()
+    logging.warning("Unknown arguments for command "
+                    "graphstorm.run.gs_link_prediction: %s",
+                    unknown_args)
+    main(gs_args)

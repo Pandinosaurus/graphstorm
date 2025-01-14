@@ -16,20 +16,19 @@
     Launch SageMaker training task
 """
 import os
-import argparse
 
 import boto3 # pylint: disable=import-error
 from sagemaker.pytorch.estimator import PyTorch
 import sagemaker
 
+from common_parser import (
+    get_common_parser,
+    parse_estimator_kwargs,
+    SUPPORTED_TASKS,
+    parse_unknown_gs_args,
+    )
+
 INSTANCE_TYPE = "ml.g4dn.12xlarge"
-SUPPORTED_TASKS = {
-    "node_classification",
-    "node_regression",
-    "edge_classification",
-    "edge_regression",
-    "link_prediction"
-}
 
 def run_job(input_args, image, unknowargs):
     """ Run job using SageMaker estimator.PyTorch
@@ -56,7 +55,9 @@ def run_job(input_args, image, unknowargs):
     graph_data_s3 = input_args.graph_data_s3 # S3 location storing partitioned graph data
     train_yaml_s3 = input_args.yaml_s3 # S3 location storing the yaml file
     model_artifact_s3 = input_args.model_artifact_s3 # Where to store model artifacts
+    model_checkpoint_to_load = input_args.model_checkpoint_to_load # S3 location of a saved model.
     custom_script = input_args.custom_script # custom_script if any
+    log_level = input_args.log_level # SageMaker runner logging level
 
     boto_session = boto3.session.Session(region_name=region)
     sagemaker_client = boto_session.client(service_name="sagemaker", region_name=region)
@@ -65,99 +66,88 @@ def run_job(input_args, image, unknowargs):
 
     container_image_uri = image
 
-    prefix = "script-mode-container"
-
-    params = {"task-type": task_type,
-              "graph-name": graph_name,
-              "graph-data-s3": graph_data_s3,
-              "train-yaml-s3": train_yaml_s3,
-              "model-artifact-s3": model_artifact_s3}
+    params = {
+        "graph-data-s3": graph_data_s3,
+        "graph-name": graph_name,
+        "log-level": log_level,
+        "model-artifact-s3": model_artifact_s3,
+        "task-type": task_type,
+        "train-yaml-s3": train_yaml_s3,
+    }
     if custom_script is not None:
         params["custom-script"] = custom_script
-    # We must handle cases like
-    # --target-etype query,clicks,asin query,search,asin
-    # --feat-name ntype0:feat0 ntype1:feat1
-    unknow_idx = 0
-    while unknow_idx < len(unknowargs):
-        assert unknowargs[unknow_idx].startswith("--")
-        sub_params = []
-        for i in range(unknow_idx+1, len(unknowargs)+1):
-            # end of loop or stand with --
-            if i == len(unknowargs) or \
-                unknowargs[i].startswith("--"):
-                break
-            sub_params.append(unknowargs[i])
-        params[unknowargs[unknow_idx][2:]] = ' '.join(sub_params)
-        unknow_idx = i
+    if model_checkpoint_to_load is not None:
+        params["model-checkpoint-to-load"] = model_checkpoint_to_load
+    unknown_args_dict = parse_unknown_gs_args(unknowargs)
+    params.update(unknown_args_dict)
 
-    print(f"Parameters {params}")
-    print(f"GraphStorm Parameters {unknowargs}")
+    print(f"SageMaker launch parameters {params}")
+    print(f"GraphStorm forwarded parameters {unknown_args_dict}")
+    if input_args.sm_estimator_parameters:
+        print(f"SageMaker Estimator parameters: '{input_args.sm_estimator_parameters}'")
+
+    estimator_kwargs = parse_estimator_kwargs(input_args.sm_estimator_parameters)
 
     est = PyTorch(
         entry_point=os.path.basename(entry_point),
-        source_dir=os.path.dirname(entry_point),
+        hyperparameters=params,
         image_uri=container_image_uri,
-        role=role,
         instance_count=instance_count,
         instance_type=instance_type,
         output_path=model_artifact_s3,
         py_version="py3",
-        base_job_name=prefix,
-        hyperparameters=params,
+        role=role,
         sagemaker_session=sess,
+        source_dir=os.path.dirname(entry_point),
         tags=[{"Key":"GraphStorm", "Value":"oss"},
               {"Key":"GraphStorm_Task", "Value":"Training"}],
+        **estimator_kwargs
     )
 
-    est.fit({"train": train_yaml_s3}, job_name=sm_task_name, wait=True)
+    est.fit({"train": train_yaml_s3}, job_name=sm_task_name, wait=not input_args.async_execution)
 
-def parse_args():
-    """ Add arguments
+def get_train_parser():
     """
-    parser = argparse.ArgumentParser()
+    Return a parser for a GraphStorm training task.
+    """
+    parser = get_common_parser()
 
-    parser.add_argument("--image-url", type=str,
-        help="Training docker image")
-    parser.add_argument("--role", type=str,
-        help="SageMaker role")
-    parser.add_argument("--instance-type", type=str,
-        default=INSTANCE_TYPE,
-        help="instance type used to train models")
+    training_args = parser.add_argument_group("Training Arguments")
 
-    parser.add_argument("--instance-count", type=int,
-        default=2,
-        help="number of infernece instances")
-    parser.add_argument("--region", type=str,
-        default="us-east-1",
-        help="Region")
-    parser.add_argument("--entry-point", type=str,
+    training_args.add_argument("--entry-point", type=str,
         default="graphstorm/sagemaker/run/train_entry.py",
         help="PATH-TO graphstorm/sagemaker/scripts/sagemaker_train.py")
-    parser.add_argument("--task-name", type=str,
-        default=None, help="User defined SageMaker task name")
 
     # task specific
-    parser.add_argument("--graph-name", type=str, help="Graph name")
-    parser.add_argument("--graph-data-s3", type=str,
-        help="S3 location of input training graph")
-    parser.add_argument("--task-type", type=str,
-        help=f"Task type in {SUPPORTED_TASKS}")
-    parser.add_argument("--yaml-s3", type=str,
+    training_args.add_argument("--graph-name", type=str, help="Graph name",
+        required=True)
+    training_args.add_argument("--task-type", type=str,
+        help=f"Task type in {SUPPORTED_TASKS}", required=True)
+    training_args.add_argument("--yaml-s3", type=str,
         help="S3 location of training yaml file. "
-             "Do not store it with partitioned graph")
-    parser.add_argument("--model-artifact-s3", type=str, default=None,
-        help="S3 bucket to save model artifacts")
-    parser.add_argument("--custom-script", type=str, default=None,
+             "Do not store it with partitioned graph", required=True)
+    training_args.add_argument("--model-artifact-s3", type=str, default=None,
+        help="S3 path to save model artifacts")
+    training_args.add_argument("--model-checkpoint-to-load", type=str, default=None,
+        help="S3 path to a model checkpoint from a previous training task "
+             "that is going to be resumed.")
+    training_args.add_argument("--custom-script", type=str, default=None,
         help="Custom training script provided by a customer to run customer training logic. \
             Please provide the path of the script within the docker image")
+    training_args.add_argument('--log-level', default='INFO',
+        type=str, choices=['DEBUG', 'INFO', 'WARNING', 'CRITICAL', 'FATAL'])
 
     return parser
 
 if __name__ == "__main__":
-    arg_parser = parse_args()
+    arg_parser = get_train_parser()
     args, unknownargs = arg_parser.parse_known_args()
-    print(args)
+    print(f"Train launch Known args: '{args}'")
+    print(f"Train launch unknown args:{type(unknownargs)=} '{unknownargs=}'")
 
     train_image = args.image_url
+
+    if not args.instance_type:
+        args.instance_type = INSTANCE_TYPE
 
     run_job(args, train_image, unknownargs)

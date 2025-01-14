@@ -20,7 +20,7 @@ import copy
 import json
 import os
 import pyarrow.parquet as pq
-import pyarrow as pa
+import pandas as pd
 import numpy as np
 
 from graphstorm.gconstruct.file_io import write_data_parquet, write_data_json, write_data_csv
@@ -33,8 +33,16 @@ from graphstorm.gconstruct.file_io import write_data_hdf5, write_index_json
 # without labels, 4) features of different types, 5) node features
 # with different dimensions.
 # We create multiple edges in a similar way.
+def gen_rand_nid(max_nid, num_nodes):
+    node_ids = np.unique(np.random.randint(0, max_nid, num_nodes))
+    if len(node_ids) != num_nodes:
+        print(f"The length of generated node ids is {len(node_ids)}."
+              "But {num_nodes} is needed. Regenerate the node ids.")
+        return gen_rand_nid(max_nid, num_nodes)
+    return node_ids
 
-node_id1 = np.unique(np.random.randint(0, 1000000000, 10000))
+np.random.seed(1)
+node_id1 = gen_rand_nid(1000000000, 10000)
 node_text = np.array([str(nid) for nid in node_id1])
 node_data1 = {
     'id': node_id1,
@@ -61,7 +69,7 @@ node_data2 = {
             + [str(i) for i in range(10)],
 }
 
-node_id3 = np.unique(np.random.randint(0, 1000000000, 5000))
+node_id3 = gen_rand_nid(1000000000, 5000)
 node_id3_str = np.array([str(nid) for nid in node_id3])
 node_data3 = {
     'id': node_id3_str,
@@ -69,7 +77,7 @@ node_data3 = {
     'data1': node_id3,
 }
 
-node_id4 = np.unique(np.random.randint(0, 1000000000, 5000))
+node_id4 = gen_rand_nid(1000000000, 5000)
 node_id4_str = np.array([str(nid) for nid in node_id3])
 node_data4 = {
     'id': node_id4_str,
@@ -82,9 +90,12 @@ edge_data1 = {
     'dst': dst1,
     'label': (src1 + dst1) % 100,
 }
+src2 = node_data1['id'][np.random.randint(0, 9999, 50000)]
+dst2 = node_data1['id'][np.random.randint(0, 9999, 50000)]
 edge_data2 = {
-    'src': node_data1['id'][np.random.randint(0, 9999, 50000)],
-    'dst': node_data1['id'][np.random.randint(0, 9999, 50000)],
+    'src': src2,
+    'dst': dst2,
+    "hard_neg" : np.concatenate((src2.reshape(-1,1), dst2.reshape(-1,1)), axis=1).astype(str)
 }
 
 edge_data1_2_float = np.random.rand(src1.shape[0], 10) * 2
@@ -94,19 +105,26 @@ edge_data1_2 = {
     'float_feat_rank_gauss': np.random.rand(src1.shape[0], 2),
     'float_feat_rank_gauss_fp16': np.random.rand(src1.shape[0], 2),
     'float1_max_min': edge_data1_2_float,
+    'float1_bucket': edge_data1_2_float,
 }
 
 src3 = node_data2['id'][np.random.randint(0, 20000, 100000)]
 dst_idx = np.random.randint(0, 5000, 100000)
+dst3 = node_data3['id'][dst_idx]
 edge_data3 = {
     'src': src3,
-    'dst': node_data3['id'][dst_idx],
+    'dst': dst3,
     'data': src3 + node_id3[dst_idx],
     'data1': np.repeat(src3 + node_id3[dst_idx], 5).reshape(len(src3), 5),
+    "neg" : np.array([f"{str(nid)},{str(nid)}" for nid in dst3]).astype(str)
 }
 edge_data3_2 = {
     'data': src3 + node_id3[dst_idx],
 }
+edge_data3_3 = {
+    'data': [[nid, nid] for nid in dst3]
+}
+edge_data3_3['data'][0] = edge_data3_3['data'][0] + edge_data3_3['data'][0]
 
 in_dir = '/tmp/test_data/'
 out_dir = '/tmp/test_out/'
@@ -123,6 +141,11 @@ def split_data(data, num):
 
 write_index_json(node_data1['id'][:100], os.path.join(in_dir, 'node1_train.json'))
 write_index_json(node_data1['id'][100:200], os.path.join(in_dir, 'node1_valid.json'))
+
+paired_data = [[int(edge_data1["src"][i]), int(edge_data1["dst"][i])] for i in range(140)]
+write_index_json(paired_data[:100], os.path.join(in_dir, "edge1_train.json"))
+write_index_json(paired_data[100: 120], os.path.join(in_dir, "edge1_valid.json"))
+write_index_json(paired_data[120: 140], os.path.join(in_dir, "edge1_test.json"))
 for i, node_data in enumerate(split_data(node_data1, 5)):
     write_data_parquet(node_data, os.path.join(in_dir, f'node_data1_{i}.parquet'))
 write_data_hdf5(node_data1_2, os.path.join(in_dir, f'node_data1_2.hdf5'))
@@ -139,7 +162,12 @@ for i, edge_data in enumerate(split_data(edge_data2, 10)):
 write_data_hdf5(edge_data1_2, os.path.join(in_dir, f'edge_data1_2.hdf5'))
 for i, edge_data in enumerate(split_data(edge_data3, 10)):
     write_data_parquet(edge_data, os.path.join(in_dir, f'edge_data3_{i}.parquet'))
+df = pd.DataFrame(edge_data3_3)
+df.to_parquet(os.path.join(in_dir,
+                           f'ng_edge_data3.parquet'))
+
 write_data_hdf5(edge_data3_2, os.path.join(in_dir, f'edge_data3_2.hdf5'))
+
 
 node_conf = [
     {
@@ -150,6 +178,17 @@ node_conf = [
             {
                 "feature_col": "data",
                 "feature_name": "feat1",
+            },
+            {
+                "feature_col": "data",
+                "feature_name": "feat_std",
+                "transform": {"name": 'standard'}
+            },
+            {
+                "feature_col": "data",
+                "feature_name": "feat_std2",
+                "transform": {"name": 'standard',
+                              "sum": 16.0}
             },
             {
                 "feature_col": "float_max_min_2",
@@ -172,6 +211,11 @@ node_conf = [
                 "feature_name": "feat_fp16_hdf5",
                 "out_dtype": 'float16',
             },
+            {
+                "feature_col": ["data", "float3"],
+                "feature_name": "feat_multicol",
+                "out_dtype": 'float16',
+            },
         ],
     },
     {
@@ -189,7 +233,7 @@ node_conf = [
                 # tokenize_hf generates multiple features.
                 # It defines feature names itself.
                 "transform": {"name": "tokenize_hf",
-                              "bert_model": "/root/.cache/huggingface/hub/models--bert-base-uncased/snapshots/a265f773a47193eed794233aa2a0f0bb6d3eaa63/",
+                              "bert_model": "bert-base-uncased",
                               "max_seq_length": 16},
             },
             {
@@ -197,7 +241,7 @@ node_conf = [
                 "feature_name": "bert",
                 "out_dtype": 'float32',
                 "transform": {"name": "bert_hf",
-                              "bert_model": "/root/.cache/huggingface/hub/models--bert-base-uncased/snapshots/a265f773a47193eed794233aa2a0f0bb6d3eaa63/",
+                              "bert_model": "bert-base-uncased",
                               "max_seq_length": 16},
             },
             {
@@ -213,6 +257,16 @@ node_conf = [
                 "feature_name": "feat_fp16",
                 "out_dtype": 'float16',
             },
+            {
+                "feature_col": "float2",
+                "feature_name": "feat_bucket",
+                "out_dtype": 'float16',
+                "transform": {"name": "bucket_numerical",
+                              "range": [10, 50],
+                              "bucket_cnt": 2,
+                              "slide_window_size": 10
+}
+            }
         ],
         "labels":       [
             {
@@ -220,6 +274,7 @@ node_conf = [
                 "task_type":    "classification",
                 "custom_split_filenames": {"train": os.path.join(in_dir, 'node1_train.json'),
                                            "valid": os.path.join(in_dir, 'node1_valid.json')},
+                "label_stats_type": "frequency_cnt",
             },
         ],
     },
@@ -246,6 +301,10 @@ node_conf = [
                 "feature_col": "data",
                 "feature_name": "feat",
             },
+            {
+                "feature_col": "data",
+                "feature_name": "feat1",
+            },
         ],
     },
     {
@@ -268,6 +327,37 @@ edge_conf = [
                 "label_col":    "label",
                 "task_type":    "classification",
                 "split_pct":   [0.8, 0.2, 0.0],
+                "label_stats_type": "frequency_cnt",
+            },
+        ],
+    },
+    {
+        "source_id_col": "src",
+        "dest_id_col": "dst",
+        "relation": ("node1", "relation_custom", "node2"),
+        "format": {"name": "csv"},
+        "files": os.path.join(in_dir, "edge_data1_*.csv"),
+        "labels": [
+            {
+                "task_type": "link_prediction",
+                "custom_split_filenames": {"train": os.path.join(in_dir, 'edge1_train.json'),
+                                           "valid": os.path.join(in_dir, 'edge1_valid.json'),
+                                           "test": os.path.join(in_dir, 'edge1_test.json')},
+            },
+        ],
+    },
+    {
+        "source_id_col": "src",
+        "dest_id_col": "dst",
+        "relation": ("node1", "relation_custom_multi", "node2"),
+        "format": {"name": "csv"},
+        "files": os.path.join(in_dir, "edge_data1_*.csv"),
+        "labels": [
+            {
+                "task_type": "link_prediction",
+                "custom_split_filenames": {"train": os.path.join(in_dir, 'edge1_train.json'),
+                                           "valid": os.path.join(in_dir, 'edge1_valid.json'),
+                                           "test": os.path.join(in_dir, 'edge1_test.json')},
             },
         ],
     },
@@ -301,6 +391,11 @@ edge_conf = [
                 "feature_name": "feat_fp16_hdf5",
                 "out_dtype": 'float16',
             },
+            {
+                "feature_col": ["float1", "float1_fp16"],
+                "feature_name": "feat_multicol",
+                "out_dtype": 'float16',
+            }
         ],
     },
     {
@@ -312,8 +407,15 @@ edge_conf = [
         "labels":       [
             {
                 "task_type":    "link_prediction",
-                "split_pct":   [0.8, 0.2, 0.0],
+                "split_pct":   [0.8, 0.2, 0.0]
             },
+        ],
+        "features": [
+            {
+                "feature_col": "hard_neg",
+                "feature_name": "hard_neg",
+                "transform": {"name": "edge_dst_hard_negative"}
+            }
         ],
     },
     {
@@ -327,6 +429,24 @@ edge_conf = [
                 "feature_col": "data",
                 "feature_name": "feat",
             },
+            {
+                "feature_col": "neg",
+                "feature_name": "hard_neg",
+                "transform": {"name": "edge_dst_hard_negative",
+                              "separator": ","}
+            }
+        ],
+    },
+    {
+        "relation":         ("node2", "relation3", "node3"),
+        "format":           {"name": "parquet"},
+        "files":            os.path.join(in_dir, "ng_edge_data3.parquet"),
+        "features": [
+            {
+                "feature_col": "data",
+                "feature_name": "hard_neg2",
+                "transform": {"name": "edge_dst_hard_negative"}
+            },
         ],
     },
     {
@@ -339,10 +459,118 @@ edge_conf = [
                 "feature_name": "feat2",
             },
         ],
-    },
+    }
 ]
 transform_conf = {
     "nodes": node_conf,
     "edges": edge_conf,
 }
 json.dump(transform_conf, open(os.path.join(in_dir, 'test_data_transform.conf'), 'w'), indent=4)
+
+node_conf = [
+    {
+        "node_type": "node1",
+        "format": {"name": "hdf5"},
+        "files": os.path.join(in_dir, "node_data1_2.hdf5"),
+        "features": [
+            {
+                "feature_col": "data",
+                "feature_name": "feat1",
+            }
+        ]
+    },
+    {
+        "node_id_col": "id",
+        "node_type": "node1",
+        "format": {"name": "parquet"},
+        "files": os.path.join(in_dir, "node_data1_*.parquet"),
+        "features": [
+            {
+                "feature_col": "data",
+                "feature_name": "feat",
+            }
+        ],
+        "labels":       [
+            {
+                "label_col":    "label",
+                "task_type":    "classification",
+                "custom_split_filenames": {"train": os.path.join(in_dir, 'node1_train.json'),
+                                           "valid": os.path.join(in_dir, 'node1_valid.json')},
+                "label_stats_type": "frequency_cnt",
+                "mask_field_names": ["train_m", "val_m", "test_m"]
+            },
+        ],
+    },
+    {
+        "node_id_col": "id",
+        "node_type": "node2",
+        "format": {"name": "parquet"},
+        "files": os.path.join(in_dir, "node_data2_*.parquet"),
+        "features": [
+            {
+                "feature_col": "data",
+                "feature_name": "category",
+                "transform": {"name": "to_categorical"},
+            },
+        ],
+    }
+]
+
+edge_conf = [
+    {
+        "source_id_col":    "src",
+        "dest_id_col":      "dst",
+        "relation":         ("node1", "relation1", "node2"),
+        "format":           {"name": "csv"},
+        "files":            os.path.join(in_dir, "edge_data1_*.csv"),
+        "labels":       [
+            {
+                "label_col":    "label",
+                "task_type":    "classification",
+                "split_pct":   [0.8, 0.2, 0.0],
+                "label_stats_type": "frequency_cnt",
+                "mask_field_names": ["train_m", "val_m", "test_m"]
+            },
+        ],
+    },
+    {
+        "source_id_col": "src",
+        "dest_id_col": "dst",
+        "relation": ("node1", "relation_custom", "node2"),
+        "format": {"name": "csv"},
+        "files": os.path.join(in_dir, "edge_data1_*.csv"),
+        "labels": [
+            {
+                "task_type": "link_prediction",
+                "custom_split_filenames": {"train": os.path.join(in_dir, 'edge1_train.json'),
+                                           "valid": os.path.join(in_dir, 'edge1_valid.json'),
+                                           "test": os.path.join(in_dir, 'edge1_test.json')},
+                "mask_field_names": ["train_m", "val_m", "test_m"]
+            },
+        ],
+    },
+    {
+
+        "relation": ("node1", "relation1", "node2"),
+        "format": {"name": "hdf5"},
+        "files": os.path.join(in_dir, "edge_data1_2.hdf5"),
+        "features": [
+            {
+                "feature_col": "float1",
+                "feature_name": "feat1",
+            },
+            {
+                "feature_col": "float1_max_min",
+                "feature_name": "max_min_norm",
+                "transform": {"name": 'max_min_norm'}
+            }
+        ]
+    }
+]
+
+transform_conf = {
+    "nodes": node_conf,
+    "edges": edge_conf,
+}
+
+json.dump(transform_conf, open(os.path.join(in_dir, 'test_data_transform_custom_mask.conf'), 'w'), indent=4)

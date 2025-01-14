@@ -20,6 +20,10 @@ job_type_info = {
         'job_definition': 'graphstorm-definition-gpu',
         'job_queue': 'graphstorm-queue-v1',
     },
+    'CI-GPU-DGL230': {
+        'job_definition': 'graphstorm-definition-gpu-dgl230',
+        'job_queue': 'graphstorm-queue-graphbolt',
+    },
     'CI-LINT': {
         'job_definition': 'graphstorm-definition-lint',
         'job_queue': 'graphstorm-queue-lint',
@@ -35,6 +39,18 @@ job_type_info = {
     'CI-LINT-PUSH': {
         'job_definition': 'graphstorm-definition-lint',
         'job_queue': 'graphstorm-queue-lint',
+    },
+    'CI-CPU-CHECK-PUSH': {
+        'job_definition': 'graphstorm-definition-check',
+        'job_queue': 'graphstorm-queue-lint',
+    },
+    'CI-CPU-CHECK': {
+        'job_definition': 'graphstorm-definition-check',
+        'job_queue': 'graphstorm-queue-lint',
+    },
+    'CI-GSProcessing-CHECK': {
+        'job_definition': 'graphstorm-gsprocessing-definition',
+        'job_queue': 'graphstorm-queue-v2',
     }
 }
 

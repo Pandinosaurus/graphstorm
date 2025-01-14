@@ -17,11 +17,15 @@
     node regression, edge classification and edge regression.
 """
 
-import dgl
-import numpy as np
-import torch as th
 import argparse
 import time
+import numpy as np
+import torch as th
+
+import dgl
+from dgl.distributed.constants import DEFAULT_NTYPE
+from dgl.distributed.constants import DEFAULT_ETYPE
+
 from graphstorm.data import OGBTextFeatDataset
 from graphstorm.data import MovieLens100kNCDataset
 from graphstorm.data import ConstructedGraphDataset
@@ -89,9 +93,16 @@ if __name__ == '__main__':
     argparser.add_argument('--num-trainers-per-machine', type=int, default=1,
                            help='the number of trainers per machine. The trainer ids are stored\
                                 in the node feature \'trainer_id\'')
+    argparser.add_argument('--is-homo', action='store_true', help='if user wants to '
+                                'start a partition on homogeneous graph')
     # output arguments
     argparser.add_argument('--output', type=str, default='data',
                            help='The output directory to store the partitioned results.')
+    # bert model name if any
+    argparser.add_argument('--lm-model-name', type=str, default='bert-base-uncased',
+                           help='lm model use to encode text feature if any')
+    argparser.add_argument('--max-seq-length', type=int, default=128,
+                           help="maximum sequence length when tokenizing text data")
 
     args = argparser.parse_args()
     print(args)
@@ -102,13 +113,20 @@ if __name__ == '__main__':
     # load graph data
     if args.dataset == 'ogbn-arxiv':
         dataset = OGBTextFeatDataset(args.filepath, dataset=args.dataset,
-                                     retain_original_features=args.retain_original_features)
+                                     retain_original_features=args.retain_original_features,
+                                     max_sequence_length=args.max_seq_length,
+                                     lm_model_name=args.lm_model_name)
     elif args.dataset == 'ogbn-products':
         dataset = OGBTextFeatDataset(args.filepath, dataset=args.dataset,
-                                     retain_original_features=args.retain_original_features)
-    elif args.dataset == 'ogbn-papers100m':
+                                     retain_original_features=args.retain_original_features,
+                                     max_sequence_length=args.max_seq_length,
+                                     lm_model_name=args.lm_model_name)
+    elif args.dataset == 'ogbn-papers100M' or args.dataset == 'ogbn-papers100m':
+        args.dataset = 'ogbn-papers100M'
         dataset = OGBTextFeatDataset(args.filepath, dataset=args.dataset,
-                                     retain_original_features=args.retain_original_features)
+                                     retain_original_features=args.retain_original_features,
+                                     max_sequence_length=args.max_seq_length,
+                                     lm_model_name=args.lm_model_name)
     elif args.dataset == 'movie-lens-100k':
         dataset = MovieLens100kNCDataset(args.filepath)
     elif args.dataset == 'movie-lens-100k-text':
@@ -127,13 +145,13 @@ if __name__ == '__main__':
     pred_ntypes = args.target_ntype.split(',') if args.target_ntype is not None else None
     if pred_ntypes is None:
         try:
-            pred_ntypes = [dataset.predict_category]
+            pred_ntypes = [dataset.predict_category] if not args.is_homo else [DEFAULT_NTYPE]
         except:
             pass
     pred_etypes = [tuple(args.target_etype.split(','))] if args.target_etype is not None else None
     if pred_etypes is None:
         try:
-            pred_etypes = [dataset.target_etype]
+            pred_etypes = [dataset.target_etype] if not args.is_homo else [DEFAULT_ETYPE]
         except:
             pass
     assert pred_ntypes is not None or pred_etypes is not None, \

@@ -15,13 +15,15 @@
 
     Inference script for node classification/regression tasks with GNN
 """
+import logging
 
 import graphstorm as gs
 from graphstorm.config import get_argument_parser
 from graphstorm.config import GSConfig
-from graphstorm.inference import GSgnnNodePredictionInfer
-from graphstorm.eval import GSgnnAccEvaluator, GSgnnRegressionEvaluator
-from graphstorm.dataloading import GSgnnNodeInferData, GSgnnNodeDataLoader
+from graphstorm.inference import GSgnnNodePredictionInferrer
+from graphstorm.eval import GSgnnClassificationEvaluator, GSgnnRegressionEvaluator
+from graphstorm.dataloading import GSgnnData, GSgnnNodeDataLoader
+from graphstorm.utils import get_device, get_lm_ntypes, use_wholegraph
 
 def get_evaluator(config): # pylint: disable=unused-argument
     """ Get evaluator class
@@ -30,9 +32,9 @@ def get_evaluator(config): # pylint: disable=unused-argument
         return GSgnnRegressionEvaluator(config.eval_frequency,
                                         config.eval_metric)
     elif config.task_type == 'node_classification':
-        return GSgnnAccEvaluator(config.eval_frequency,
-                                 config.eval_metric,
-                                 config.multilabel)
+        return GSgnnClassificationEvaluator(config.eval_frequency,
+                                            config.eval_metric,
+                                            config.multilabel)
     else:
         raise AttributeError(config.task_type + ' is not supported.')
 
@@ -41,47 +43,53 @@ def main(config_args):
     """
     config = GSConfig(config_args)
     config.verify_arguments(False)
-    gs.initialize(ip_config=config.ip_config, backend=config.backend)
 
-    infer_data = GSgnnNodeInferData(config.graph_name,
-                                    config.part_config,
-                                    eval_ntypes=config.target_ntype,
-                                    node_feat_field=config.node_feat_name,
-                                    label_field=config.label_field)
+    use_wg_feats = use_wholegraph(config.part_config)
+    gs.initialize(ip_config=config.ip_config, backend=config.backend,
+                  local_rank=config.local_rank,
+                  use_wholegraph=config.use_wholegraph_embed or use_wg_feats,
+                  use_graphbolt=config.use_graphbolt)
+
+    infer_data = GSgnnData(config.part_config,
+                           node_feat_field=config.node_feat_name,
+                           edge_feat_field=config.edge_feat_name,
+                           lm_feat_ntypes=get_lm_ntypes(config.node_lm_configs))
+
     model = gs.create_builtin_node_gnn_model(infer_data.g, config, train_task=False)
-    model.restore_model(config.restore_model_path)
-    # TODO(zhengda) we should use a different way to get rank.
-    infer = GSgnnNodePredictionInfer(model, gs.get_rank())
-    infer.setup_cuda(dev_id=config.local_rank)
+    model.restore_model(config.restore_model_path,
+                        model_layer_to_load=config.restore_model_layers)
+    infer = GSgnnNodePredictionInferrer(model)
+    infer.setup_device(device=get_device())
     if not config.no_validation:
+        infer_idxs = infer_data.get_node_test_set(config.target_ntype)
         evaluator = get_evaluator(config)
         infer.setup_evaluator(evaluator)
-        assert len(infer_data.test_idxs) > 0, \
+        assert len(infer_idxs) > 0, \
             "There is not test data for evaluation. " \
             "You can use --no-validation true to avoid do testing"
-        target_idxs = infer_data.test_idxs
     else:
-        assert len(infer_data.infer_idxs) > 0, \
+        infer_idxs = infer_data.get_node_infer_set(config.target_ntype)
+        assert len(infer_idxs) > 0, \
             f"To do inference on {config.target_ntype} without doing evaluation, " \
             "you should not define test_mask as its node feature. " \
             "GraphStorm will do inference on the whole node set. "
-        target_idxs = infer_data.infer_idxs
-    tracker = gs.create_builtin_task_tracker(config, infer.rank)
+    tracker = gs.create_builtin_task_tracker(config)
     infer.setup_task_tracker(tracker)
-    device = 'cuda:%d' % infer.dev_id
     fanout = config.eval_fanout if config.use_mini_batch_infer else []
-    dataloader = GSgnnNodeDataLoader(infer_data, target_idxs, fanout=fanout,
-                                     batch_size=config.eval_batch_size, device=device,
-                                     train_task=False)
-    # Preparing input layer for training or inference.
-    # The input layer can pre-compute node features in the preparing step if needed.
-    # For example pre-compute all BERT embeddings
-    model.prepare_input_encoder(infer_data)
+    dataloader = GSgnnNodeDataLoader(infer_data, infer_idxs, fanout=fanout,
+                                     batch_size=config.eval_batch_size,
+                                     train_task=False,
+                                     node_feats=config.node_feat_name,
+                                     edge_feats=config.edge_feat_name,
+                                     label_field=config.label_field,
+                                     construct_feat_ntype=config.construct_feat_ntype,
+                                     construct_feat_fanout=config.construct_feat_fanout)
     infer.infer(dataloader, save_embed_path=config.save_embed_path,
                 save_prediction_path=config.save_prediction_path,
                 use_mini_batch_infer=config.use_mini_batch_infer,
                 node_id_mapping_file=config.node_id_mapping_file,
-                return_proba=config.return_proba)
+                return_proba=config.return_proba,
+                save_embed_format=config.save_embed_format)
 
 def generate_parser():
     """ Generate an argument parser
@@ -92,6 +100,10 @@ def generate_parser():
 if __name__ == '__main__':
     arg_parser=generate_parser()
 
-    args = arg_parser.parse_args()
-    print(args)
-    main(args)
+    # Ignore unknown args to make script more robust to input arguments
+    gs_args, unknown_args = arg_parser.parse_known_args()
+    logging.warning("Unknown arguments for command "
+                    "graphstorm.run.gs_node_classification or "
+                    "graphstorm.run.gs_node_regression: %s",
+                    unknown_args)
+    main(gs_args)

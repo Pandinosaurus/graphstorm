@@ -17,7 +17,6 @@ import os
 import json
 import dgl
 import pyarrow.parquet as pq
-import pyarrow as pa
 import numpy as np
 import torch as th
 import argparse
@@ -39,7 +38,7 @@ argparser.add_argument("--conf_file", type=str, required=True,
 args = argparser.parse_args()
 out_dir = args.graph_dir
 with open(args.conf_file, 'r') as f:
-  conf = json.load(f)
+    conf = json.load(f)
 
 if args.graph_format == "DGL":
     g = dgl.load_graphs(os.path.join(out_dir, "test.dgl"))[0][0]
@@ -58,14 +57,30 @@ elif args.graph_format == "DistDGL":
 else:
     raise ValueError('Invalid graph format: {}'.format(args.graph_format))
 
-node1_map = read_data_parquet(os.path.join(out_dir, "node1_id_remap.parquet"))
+node1_map = read_data_parquet(os.path.join(out_dir, "raw_id_mappings", "node1"))
 reverse_node1_map = {val: key for key, val in zip(node1_map['orig'], node1_map['new'])}
-node3_map = read_data_parquet(os.path.join(out_dir, "node3_id_remap.parquet"))
+node3_map = read_data_parquet(os.path.join(out_dir, "raw_id_mappings", "node3"))
 reverse_node3_map = {val: key for key, val in zip(node3_map['orig'], node3_map['new'])}
 
 # Test the first node data
 assert g.nodes['node1'].data['feat'].dtype is th.float32
 assert g.nodes['node1'].data['feat1'].dtype is th.float32
+
+# Test standard norm for node data
+data = g.nodes['node1'].data['feat1'].numpy()
+assert g.nodes['node1'].data['feat_std'].dtype is th.float32
+
+data_sum = np.sum(data, axis=0)
+np.testing.assert_almost_equal(
+    g.nodes['node1'].data['feat_std'].numpy(),
+    data/data_sum)
+
+# Test standard norm with given sum
+assert g.nodes['node1'].data['feat_std2'].dtype is th.float32
+np.testing.assert_almost_equal(
+    g.nodes['node1'].data['feat_std2'].numpy(),
+    data/16.0)
+
 data = g.nodes['node1'].data['feat'].numpy()
 data1 = g.nodes['node1'].data['feat1'].numpy()
 assert 'input_ids' in g.nodes['node1'].data
@@ -106,10 +121,14 @@ assert data.dtype is th.float16
 data = np.sort(data.numpy(), axis=0)
 rev_data = np.flip(data, axis=0)
 assert np.all(data + rev_data == 0)
+data = g.nodes["node1"].data['feat_multicol']
+assert data.dtype is th.float16
 
 
 #test data type
 data = g.nodes['node1'].data['feat2']
+assert data.dtype is th.float16
+data = g.nodes['node1'].data['feat_bucket']
 assert data.dtype is th.float16
 data = g.nodes['node1'].data['feat_fp16']
 assert data.dtype is th.float16
@@ -130,7 +149,7 @@ for node_conf in conf["nodes"]:
         assert len(node_conf["features"][0]["transform"]["mapping"]) == 10
 
 # id remap for node4 exists
-assert os.path.isfile(os.path.join(out_dir, "node4_id_remap.parquet"))
+assert os.path.isdir(os.path.join(out_dir, "raw_id_mappings", "node4"))
 
 # Test the edge data of edge type 1
 src_ids, dst_ids = g.edges(etype=('node1', 'relation1', 'node2'))
@@ -157,6 +176,8 @@ assert data.dtype is th.float16
 data = np.sort(data.numpy(), axis=0)
 rev_data = np.flip(data, axis=0)
 assert np.all(data + rev_data == 0)
+data = g.edges[('node1', 'relation1', 'node2')].data['feat_multicol']
+assert data.dtype is th.float16
 
 #test data type
 data = g.edges[('node1', 'relation1', 'node2')].data['feat1']
@@ -185,3 +206,55 @@ dst_ids = np.array([int(reverse_node3_map[dst_id]) for dst_id in dst_ids.numpy()
 # here need to convert feat back to 1D to pass test
 np.testing.assert_allclose(src_ids + dst_ids, feat.reshape(-1,))
 np.testing.assert_allclose(src_ids + dst_ids, feat2.reshape(-1,))
+
+assert os.path.exists(os.path.join(out_dir, "node_label_stats.json"))
+assert os.path.exists(os.path.join(out_dir, "edge_label_stats.json"))
+
+with open(os.path.join(out_dir, "node_label_stats.json"), 'r') as f:
+    node_label_stats = json.load(f)
+    assert "node1" in node_label_stats
+    assert "label" in node_label_stats["node1"]
+
+with open(os.path.join(out_dir, "edge_label_stats.json"), 'r') as f:
+  edge_label_stats = json.load(f)
+  assert ("node1,relation1,node2") in edge_label_stats
+  assert "label" in edge_label_stats[("node1,relation1,node2")]
+
+# Test customized link prediction data split
+src_ids, dst_ids = g.edges(etype=('node1', 'relation_custom', 'node2'))
+src_ids = np.array([reverse_node1_map[src_id] for src_id in src_ids.numpy()])
+dst_ids = dst_ids.numpy()
+assert np.all((src_ids + dst_ids) % 100 == label)
+assert th.sum(g.edges[('node1', 'relation_custom', 'node2')].data['train_mask']) \
+        == 100
+assert th.sum(g.edges[('node1', 'relation_custom', 'node2')].data['val_mask']) \
+        == 20
+assert th.sum(g.edges[('node1', 'relation_custom', 'node2')].data['test_mask']) == 20
+
+src_ids, dst_ids = g.edges(etype=('node1', 'relation_custom_multi', 'node2'))
+src_ids = np.array([reverse_node1_map[src_id] for src_id in src_ids.numpy()])
+dst_ids = dst_ids.numpy()
+assert np.all((src_ids + dst_ids) % 100 == label)
+assert th.sum(g.edges[('node1', 'relation_custom_multi', 'node2')].data['train_mask']) \
+        == 100
+assert th.sum(g.edges[('node1', 'relation_custom_multi', 'node2')].data['val_mask']) \
+        == 20
+assert th.sum(g.edges[('node1', 'relation_custom_multi', 'node2')].data['test_mask']) == 20
+
+# Test hard negatives
+hard_neg = g.edges[('node1', 'relation2', 'node1')].data["hard_neg"]
+src_ids, dst_ids = g.edges(etype=("node1", "relation2", "node1"))
+ground_truth = th.cat((src_ids.reshape(-1,1), dst_ids.reshape(-1,1)), dim=1)
+assert th.sum(hard_neg-ground_truth) == 0
+
+hard_neg = g.edges[("node2", "relation3", "node3")].data["hard_neg"]
+_, dst_ids = g.edges(etype=("node2", "relation3", "node3"))
+ground_truth = th.cat((dst_ids.reshape(-1,1), dst_ids.reshape(-1,1)), dim=1)
+assert th.sum(hard_neg-ground_truth) == 0
+
+hard_neg = g.edges[("node2", "relation3", "node3")].data["hard_neg2"]
+_, dst_ids = g.edges(etype=("node2", "relation3", "node3"))
+ground_truth = th.cat([dst_ids.reshape(-1,1), dst_ids.reshape(-1,1), th.full((dst_ids.shape[0], 2), -1, dtype=dst_ids.dtype)], dim=1)
+ground_truth[0][2] = dst_ids[0]
+ground_truth[0][3] = dst_ids[0]
+assert th.sum(hard_neg-ground_truth) == 0

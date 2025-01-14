@@ -11,11 +11,12 @@ import graphstorm as gs
 from graphstorm.config import GSConfig
 from graphstorm import model as gsmodel
 from graphstorm.trainer import GSgnnNodePredictionTrainer
-from graphstorm.inference import GSgnnNodePredictionInfer
-from graphstorm.dataloading import GSgnnNodeTrainData, GSgnnNodeInferData
+from graphstorm.inference import GSgnnNodePredictionInferrer
+from graphstorm.dataloading import GSgnnData
 from graphstorm.dataloading import GSgnnNodeDataLoader
-from graphstorm.eval import GSgnnAccEvaluator
+from graphstorm.eval import GSgnnClassificationEvaluator
 from graphstorm.tracker import GSSageMakerTaskTracker
+from graphstorm.utils import get_device
 
 from dgl.nn.functional import edge_softmax
 
@@ -195,7 +196,8 @@ class HGT(gsmodel.GSgnnNodeModelBase):
             if self.adapt_ws[ntype] is None:
                 n_id = self.node_dict[ntype]
                 emb_id = self.ntype_id_map[n_id]
-                embeding = self.ntype_embed(torch.Tensor([emb_id]).long().to('cuda'))
+                device = self.ntype_embed.device
+                embeding = self.ntype_embed(torch.Tensor([emb_id]).long().to(device))
                 n_embed = embeding.expand(blocks[0].num_nodes(ntype), -1)
             else:
                 n_embed = self.adapt_ws[ntype](node_feats[ntype])
@@ -227,7 +229,8 @@ class HGT(gsmodel.GSgnnNodeModelBase):
             if self.adapt_ws[ntype] is None:
                 n_id = self.node_dict[ntype]
                 emb_id = self.ntype_id_map[n_id]
-                embeding = self.ntype_embed(torch.Tensor([emb_id]).long().to('cuda'))
+                device = self.ntype_embed.device
+                embeding = self.ntype_embed(torch.Tensor([emb_id]).long().to(device))
                 n_embed = embeding.expand(blocks[0].num_nodes(ntype), -1)
             else:
                 n_embed = self.adapt_ws[ntype](node_feats[ntype])
@@ -257,8 +260,9 @@ class HGT(gsmodel.GSgnnNodeModelBase):
 
 
 def main(args):
-    gs.initialize(ip_config=args.ip_config, backend="gloo")
     config = GSConfig(args)
+    gs.initialize(ip_config=args.ip_config, backend="gloo",
+                  local_rank=config.local_rank)
 
     # Process node_feat_field to define GraphStorm dataset
     node_feat_fields = {}
@@ -268,11 +272,7 @@ def main(args):
         node_feat_fields[node_type] = feat_names.split(',')
 
     # Define the GraphStorm training dataset
-    train_data = GSgnnNodeTrainData(config.graph_name,
-                                    config.part_config,
-                                    train_ntypes=config.target_ntype,
-                                    node_feat_field=node_feat_fields,
-                                    label_field=config.label_field)
+    train_data = GSgnnData(config.part_config)
 
     # Create input arguments for the HGT model
     node_dict = {}
@@ -304,35 +304,45 @@ def main(args):
                 lr=config.lr)
 
     # Create a trainer for the node classification task.
-    trainer = GSgnnNodePredictionTrainer(model, gs.get_rank(), topk_model_to_save=config.topk_model_to_save)
-    trainer.setup_cuda(dev_id=gs.get_rank())
-    device = 'cuda:%d' % trainer.dev_id
+    trainer = GSgnnNodePredictionTrainer(model, topk_model_to_save=config.topk_model_to_save)
+    trainer.setup_device(device=get_device())
 
+    train_idxs = train_data.get_node_train_set(config.target_ntype)
     # Define the GraphStorm train dataloader
-    dataloader = GSgnnNodeDataLoader(train_data, train_data.train_idxs, fanout=config.fanout,
-                                     batch_size=config.batch_size, device=device, train_task=True)
+    dataloader = GSgnnNodeDataLoader(train_data, train_idxs, fanout=config.fanout,
+                                     batch_size=config.batch_size,
+                                     node_feats=node_feat_fields,
+                                     label_field=config.label_field,
+                                     train_task=True)
 
+    eval_ntype = config.eval_target_ntype
+    val_idxs = train_data.get_node_val_set(eval_ntype)
+    test_idxs = train_data.get_node_test_set(eval_ntype)
     # Optional: Define the evaluation dataloader
-    eval_dataloader = GSgnnNodeDataLoader(train_data, train_data.val_idxs,fanout=config.fanout,
-                                          batch_size=config.eval_batch_size, device=device,
+    eval_dataloader = GSgnnNodeDataLoader(train_data, val_idxs, fanout=config.fanout,
+                                          batch_size=config.eval_batch_size,
+                                          node_feats=node_feat_fields,
+                                          label_field=config.label_field,
                                           train_task=False)
 
     # Optional: Define the evaluation dataloader
-    test_dataloader = GSgnnNodeDataLoader(train_data, train_data.test_idxs,fanout=config.fanout,
-                                          batch_size=config.eval_batch_size, device=device,
+    test_dataloader = GSgnnNodeDataLoader(train_data, test_idxs, fanout=config.fanout,
+                                          batch_size=config.eval_batch_size,
+                                          node_feats=node_feat_fields,
+                                          label_field=config.label_field,
                                           train_task=False)
 
     # Optional: set up a evaluator
-    evaluator = GSgnnAccEvaluator(config.eval_frequency,
-                                  config.eval_metric,
-                                  config.multilabel,
-                                  config.use_early_stop,
-                                  config.early_stop_burnin_rounds,
-                                  config.early_stop_rounds,
-                                  config.early_stop_strategy)
+    evaluator = GSgnnClassificationEvaluator(config.eval_frequency,
+                                             config.eval_metric,
+                                             config.multilabel,
+                                             config.use_early_stop,
+                                             config.early_stop_burnin_rounds,
+                                             config.early_stop_rounds,
+                                             config.early_stop_strategy)
     trainer.setup_evaluator(evaluator)
     # Optional: set up a task tracker to show the progress of training.
-    tracker = GSSageMakerTaskTracker(config, gs.get_rank())
+    tracker = GSSageMakerTaskTracker(config.eval_frequency)
     trainer.setup_task_tracker(tracker)
 
     # Start the training process.
@@ -346,20 +356,20 @@ def main(args):
     # After training, get the best model from the trainer.
     best_model_path = trainer.get_best_model_path()
     model.restore_model(best_model_path)
-    
+
     # Create a dataset for inference.
-    infer_data = GSgnnNodeInferData(config.graph_name, config.part_config,
-                                    eval_ntypes=config.target_ntype,
-                                    node_feat_field=node_feat_fields,
-                                    label_field=config.label_field)
+    infer_data = GSgnnData(config.part_config)
 
     # Create an inference for a node task.
-    infer = GSgnnNodePredictionInfer(model, gs.get_rank())
-    infer.setup_cuda(dev_id=gs.get_rank())
+    infer = GSgnnNodePredictionInferrer(model)
+    infer.setup_device(device=get_device())
     infer.setup_evaluator(evaluator)
     infer.setup_task_tracker(tracker)
-    dataloader = GSgnnNodeDataLoader(infer_data, infer_data.test_idxs,
-                                    fanout=config.fanout, batch_size=100, device=device,
+    infer_idxs = infer_data.get_node_infer_set(eval_ntype)
+    dataloader = GSgnnNodeDataLoader(infer_data,infer_idxs,
+                                    fanout=config.fanout, batch_size=100,
+                                    node_feats=node_feat_fields,
+                                    label_field=config.label_field,
                                     train_task=False)
 
     # Run inference on the inference dataset and save the GNN embeddings in the specified path.
@@ -387,10 +397,11 @@ if __name__ == '__main__':
                            default=argparse.SUPPRESS,
                           help="Print more information. \
                                 For customized models, MUST have this argument!!")
-    argparser.add_argument("--local_rank", type=int,
+    argparser.add_argument("--local-rank", type=int,
                            help="The rank of the trainer. \
                                  For customized models, MUST have this argument!!")
-    args = argparser.parse_args()
 
+    # Ignore unknown args to make script more robust to input arguments
+    args, _ = argparser.parse_known_args()
     print(args)
     main(args)

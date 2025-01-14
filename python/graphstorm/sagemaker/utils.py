@@ -115,8 +115,8 @@ def keep_alive(client_list, world_size, task_end):
 
     logging.info("keepalive thread exiting...")
 
-def terminate_workers(client_list, world_size, task_end):
-    """ termiate all worker deamons.
+def terminate_workers(client_list, world_size):
+    """ terminate all worker daemons.
 
     Parameters
     ----------
@@ -124,10 +124,7 @@ def terminate_workers(client_list, world_size, task_end):
         List of socket clients
     world_size: int
         Size of the distributed training/inference cluster
-    task_end: threading.Event
-        Indicate whether the task has finished.
     """
-    task_end.set()
     for rank in range(1, world_size):
         client_list[rank].send(b"Done")
         msg = client_list[rank].recv(8)
@@ -183,8 +180,8 @@ def download_yaml_config(yaml_s3, local_path, sagemaker_session):
     try:
         S3Downloader.download(yaml_s3, local_path,
             sagemaker_session=sagemaker_session)
-    except Exception: # pylint: disable=broad-except
-        raise RuntimeError(f"Fail to download yaml file {yaml_s3}")
+    except Exception as err: # pylint: disable=broad-except
+        raise RuntimeError(f"Fail to download yaml file {yaml_s3}: {err}")
 
     return yaml_path
 
@@ -206,11 +203,14 @@ def download_model(model_artifact_s3, model_path, sagemaker_session):
     try:
         S3Downloader.download(model_artifact_s3,
             model_path, sagemaker_session=sagemaker_session)
-    except Exception: # pylint: disable=broad-except
+    except Exception as err: # pylint: disable=broad-except
         raise RuntimeError("Can not download saved model artifact" \
-                           f"model.bin from {model_artifact_s3}.")
+                           f"model.bin from {model_artifact_s3}." \
+                           f"{err}")
 
-def download_graph(graph_data_s3, graph_name, part_id, local_path, sagemaker_session):
+def download_graph(graph_data_s3, graph_name, part_id, world_size,
+                   local_path, sagemaker_session,
+                   raw_node_mapping_prefix_s3=None):
     """ download graph data
 
     Parameters
@@ -221,10 +221,14 @@ def download_graph(graph_data_s3, graph_name, part_id, local_path, sagemaker_ses
         Graph name
     part_id: int
         Graph partition id
+    world_size: int
+        Number of instances in the cluster.
     local_path: str
         Path to store graph data
     sagemaker_session: sagemaker.session.Session
         sagemaker_session to run download
+    raw_node_mapping_prefix_s3: str, optional
+        S3 prefix to where the node_id_mapping data are stored
 
     Return
     ------
@@ -233,7 +237,6 @@ def download_graph(graph_data_s3, graph_name, part_id, local_path, sagemaker_ses
     """
     # Download partitioned graph data.
     # Each training instance only download 1 partition.
-    graph_config = f"{graph_name}.json"
     graph_part = f"part{part_id}"
 
     graph_path = os.path.join(local_path, graph_name)
@@ -243,44 +246,112 @@ def download_graph(graph_data_s3, graph_name, part_id, local_path, sagemaker_ses
 
     graph_data_s3 = graph_data_s3[:-1] if graph_data_s3.endswith('/') else graph_data_s3
 
+    # By default we assume the node mappings exist
+    # under the same path as the rest of the graph data
+    if not raw_node_mapping_prefix_s3:
+        raw_node_mapping_prefix_s3 = f"{graph_data_s3}/raw_id_mappings"
+    else:
+        raw_node_mapping_prefix_s3 = (
+            raw_node_mapping_prefix_s3[:-1] if raw_node_mapping_prefix_s3.endswith('/')
+            else raw_node_mapping_prefix_s3)
+
     # We split on '/' to get the bucket, as it's always the third split element in an S3 URI
     s3_input_bucket = graph_data_s3.split("/")[2]
     # Similarly, by having maxsplit=3 we get the S3 key value as the fourth element
     s3_input_key = graph_data_s3.split("/", maxsplit=3)[3]
 
     s3_client = boto3.client('s3')
-
-    try:
-        s3_client.head_object(Bucket=s3_input_bucket, Key=f"{s3_input_key}/{graph_config}")
-    except ClientError as err:
-        if err.response['ResponseMetadata']['HTTPStatusCode'] == 404:
-            # The key does not exist.
-            raise RuntimeError(f"Metadata key {s3_input_key}/{graph_config} does not exist")
-        if err.response['Error']['Code'] == 403:
-            # Unauthorized, including invalid bucket
-            raise RuntimeError("Authorization error, check the path and auth again:" \
+    graph_config = None
+    for config_name  in [f"{graph_name}.json", "metadata.json"]:
+        try:
+            s3_client.head_object(Bucket=s3_input_bucket, Key=f"{s3_input_key}/{config_name}")
+            # This will only be accessed if the above doesn't trigger an exception
+            graph_config = config_name
+        except ClientError as err:
+            if err.response['ResponseMetadata']['HTTPStatusCode'] == 404:
+                # The key does not exist.
+                logging.debug("Metadata key %s does not exist",
                             f"{s3_input_key}/{graph_config}")
-        raise err
+            elif err.response['Error']['Code'] == 403:
+                # Unauthorized, including invalid bucket
+                logging.error("Authorization error, check the path again: %s",
+                            f"{s3_input_key}/{graph_config}")
+            else:
+                # Something else has gone wrong.
+                raise err
 
+    assert graph_config, \
+        (f"Could not find a graph config file named {graph_name}.json or metadata.json "
+         f"under {graph_data_s3}")
     S3Downloader.download(os.path.join(graph_data_s3, graph_config),
             graph_path, sagemaker_session=sagemaker_session)
     try:
-        S3Downloader.download(os.path.join(graph_data_s3, graph_part),
+        logging.info("Download graph from %s to %s",
+                     os.path.join(os.path.join(graph_data_s3, graph_part), ""),
+                     graph_part_path)
+        # add tailing / to s3:/xxxx/partN
+        S3Downloader.download(os.path.join(os.path.join(graph_data_s3, graph_part), ""),
             graph_part_path, sagemaker_session=sagemaker_session)
-    except Exception: # pylint: disable=broad-except
-        print(f"Can not download graph_data from {graph_data_s3}.")
-        raise RuntimeError(f"Can not download graph_data from {graph_data_s3}.")
+    except Exception as err: # pylint: disable=broad-except
+        logging.error("Can not download graph_data from %s, %s.",
+                      graph_data_s3, str(err))
+        raise RuntimeError(f"Can not download graph_data from {graph_data_s3}, {err}.")
 
     node_id_mapping = "node_mapping.pt"
-
     # Try to download node id mapping file if any
     try:
+        logging.info("Download graph id mapping from %s to %s",
+                     os.path.join(graph_data_s3, node_id_mapping),
+                     graph_path)
         S3Downloader.download(os.path.join(graph_data_s3, node_id_mapping),
             graph_path, sagemaker_session=sagemaker_session)
     except Exception: # pylint: disable=broad-except
-        print("node id mapping file does not exist")
+        logging.warning("Node id mapping file does not exist."
+                        "If you are running GraphStorm on a graph with "
+                        "more than 1 partition, it is recommended to provide "
+                        "the node id mapping file created by gconstruct or gsprocessing.")
 
-    print(f"Finish download graph data from {graph_data_s3}")
+    if part_id == 0:
+        # It is possible that id mappings are generated by
+        # dgl tools/distpartitioning/convert_partition.py
+        for i in range(1, world_size):
+            local_graph_part = f"part{i}"
+            graph_part_path = os.path.join(graph_path, local_graph_part)
+            os.makedirs(graph_part_path, exist_ok=True)
+
+            # Try to download node id mapping file if any
+            s3_path = os.path.join(graph_data_s3, local_graph_part, "orig_nids.dgl")
+            try:
+                logging.info("Try to download %s to %s", s3_path, graph_part_path)
+                S3Downloader.download(s3_path,
+                    graph_part_path, sagemaker_session=sagemaker_session)
+            except Exception: # pylint: disable=broad-except
+                logging.info("node id mapping file %s does not exist", s3_path)
+
+    # Try to get GraphStorm ID to Original ID remapping files if any
+    # The S3 path can be empty, which means no Raw ID mapping is needed.
+    # For exampling during SageMaker training.
+    id_map_files = S3Downloader.list(
+        raw_node_mapping_prefix_s3, sagemaker_session=sagemaker_session)
+    for mapping_file in id_map_files:
+        # The expected layout for GConstruct mapping files on S3 is:
+        # raw_id_mappings/node_type/part-xxxxx.parquet
+        ntype = mapping_file.split("/")[-2]
+        # This is the case where the output was generated by GSProcessing
+        if ntype == "parquet":
+            # Then we have raw_id_mappings/node_type/parquet/part-xxxxx.parquet
+            ntype = mapping_file.split("/")[-3]
+        os.makedirs(os.path.join(graph_path, "raw_id_mappings", ntype), exist_ok=True)
+        try:
+            S3Downloader.download(
+                mapping_file,
+                os.path.join(graph_path, "raw_id_mappings", ntype),
+                sagemaker_session=sagemaker_session)
+        except Exception: # pylint: disable=broad-except
+            logging.warning("Could not download node id remap file %s",
+                            mapping_file)
+
+    logging.info("Finished downloading graph data from %s", graph_data_s3)
     return os.path.join(graph_path, graph_config)
 
 
@@ -299,9 +370,9 @@ def upload_data_to_s3(s3_path, data_path, sagemaker_session):
     try:
         ret = S3Uploader.upload(data_path, s3_path,
             sagemaker_session=sagemaker_session)
-    except Exception: # pylint: disable=broad-except
-        print(f"Can not upload data into {s3_path}")
-        raise RuntimeError(f"Can not upload data into {s3_path}")
+    except Exception as err: # pylint: disable=broad-except
+        logging.error("Can not upload data into %s", s3_path)
+        raise RuntimeError(f"Can not upload data into {s3_path}. {err}")
     return ret
 
 def upload_model_artifacts(model_s3_path, model_path, sagemaker_session):
@@ -320,7 +391,7 @@ def upload_model_artifacts(model_s3_path, model_path, sagemaker_session):
     sagemaker_session: sagemaker.session.Session
         sagemaker_session to run download
     """
-    print(f"Upload model artifacts to {model_s3_path}")
+    logging.info("Uploading model artifacts to %s", model_s3_path)
     # Rank0 will upload both dense models and learnable embeddings owned by Rank0.
     # Other ranks will only upload learnable embeddings owned by themselves.
     return upload_data_to_s3(model_s3_path, model_path, sagemaker_session)
@@ -328,7 +399,7 @@ def upload_model_artifacts(model_s3_path, model_path, sagemaker_session):
 def upload_embs(emb_s3_path, emb_path, sagemaker_session):
     """ Upload generated node embeddings into S3
 
-    As embeddding table is huge and each trainer/inferer only
+    As embeddding table is huge and each trainer/inferrer only
     stores part of the embedding, we need to upload them
     into S3.
 

@@ -12,7 +12,7 @@ done < "$1"
 
 graph_name=$2
 
-if [ -z "$3"]; then
+if [ -z "$3" ]; then
     port_num=2222
 else
     port_num=$3
@@ -20,6 +20,7 @@ fi
 
 for ip in "${ips[@]}"; do
     echo "Clean up $ip"
+    ssh -p $port_num -n $ip "killall -9 python"
     ssh -p $port_num -n $ip "killall -9 python3"
     ssh -p $port_num -n $ip "rm -rf /dev/shm/node:*"
     ssh -p $port_num -n $ip "rm -rf /dev/shm/edge:*"

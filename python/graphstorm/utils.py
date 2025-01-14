@@ -20,6 +20,7 @@ import json
 import time
 import resource
 import logging
+import re
 import psutil
 
 import pandas as pd
@@ -28,16 +29,125 @@ import torch as th
 import numpy as np
 
 TORCH_MAJOR_VER = int(th.__version__.split('.', maxsplit=1)[0])
+USE_WHOLEGRAPH = False
+GS_DEVICE = th.device('cpu')
+
+def check_graph_name(graph_name):
+    """ Check whether the graph name is a valid graph name.
+
+        We enforce that the graph name adheres to the Python
+        identifier naming rules as in
+        https://docs.python.org/3/reference/lexical_analysis.html#identifiers,
+        with the exception that hyphens (-) are permitted
+        and the name can start with numbers.
+        This helps avoid the cases when an invalid graph name,
+        such as `/graph`, causes unexpected errors.
+
+    Parameter
+    ---------
+    graph_name: str
+        Graph Name.
+    """
+    gname = re.sub(r'^\d+', '', graph_name)
+    assert gname.replace('-', '_').isidentifier(), \
+        "GraphStorm expects the graph name adheres to the Python" \
+        "identifier naming rules with the exception that hyphens " \
+        "(-) are permitted and the name can start with numbers. " \
+        f"Got: {graph_name}."
+
+def get_graph_name(part_config):
+    """ Get graph name from graph partition config file
+
+    Parameter
+    ---------
+    part_config: str
+        Path to graph partition config file
+
+    Return
+    ------
+        graph_name
+    """
+    with open(part_config, "r", encoding='utf-8') as f:
+        config = json.load(f)
+    graph_name = config["graph_name"]
+    check_graph_name(graph_name)
+    return graph_name
+
+def setup_device(local_rank):
+    r"""Setup computation device.
+
+    Parameters
+    -----------
+    local_rank: int
+        Rank of the current process in a distributed environment.
+
+    Returns
+    -------
+    str: device where the model runs.
+    """
+    if th.cuda.is_available():
+        assert local_rank < th.cuda.device_count(), \
+                f"local rank={local_rank} but there are {th.cuda.device_count()} GPUs."
+        device = 'cuda:%d' % local_rank
+        th.cuda.set_device(device)
+    else:
+        device = 'cpu'
+
+    global GS_DEVICE
+    GS_DEVICE = th.device(device)
+    return device
+
+def get_device():
+    """ Get the torch device to run model forward and backward
+
+    Return
+    th.device: device where the model runs
+    """
+    return GS_DEVICE
+
+def is_distributed():
+    """ Test whether the process runs in a distributed mode.
+    """
+    return th.distributed.is_initialized()
+
+def get_backend():
+    """ Get the backend of a process group.
+    """
+    assert is_distributed(), "get_backend() is valid only when is_distributed() is True."
+    return th.distributed.get_backend()
 
 def get_rank():
     """ Get rank of a process
     """
-    try:
+    if is_distributed():
         return th.distributed.get_rank()
-    except RuntimeError:
-        # If Pytorch distributed is not set up correctly, we should set
-        # the rank to 0.
-        return 0
+    return 0
+
+def get_world_size():
+    """ Get the world size.
+    """
+    if is_distributed():
+        return th.distributed.get_world_size()
+    return 1
+
+def barrier():
+    """ Run barrier among trainers.
+    """
+    if is_distributed():
+        th.distributed.barrier()
+
+def use_wholegraph(part_config):
+    """ Use wholegraph for feature fetching if 'wholegraph' folder exists
+    """
+    global USE_WHOLEGRAPH
+    USE_WHOLEGRAPH = bool(part_config is not None and os.path.isdir(os.path.join( \
+        os.path.dirname(part_config), 'wholegraph')))
+    return USE_WHOLEGRAPH
+
+def is_wholegraph():
+    """ Check whether global USE_WHOLEGRAPH is true
+    """
+    return USE_WHOLEGRAPH
 
 def estimate_mem_train(root, task):
     ''' Estimate the memory consumption per machine during training.
@@ -58,7 +168,7 @@ def estimate_mem_train(root, task):
     parts = []
     # Find the partition IDs from the folder.
     for f in os.listdir(root):
-        if os.path.isdir(os.path.join(root, f)):
+        if os.path.isdir(os.path.join(root, f)) and f.startswith("part"):
             parts.append(int(f[4:]))
     parts.sort()
     for i in parts:
@@ -94,9 +204,10 @@ def estimate_mem_train(root, task):
             max_cli_mem = max_cli_mem / 1024/1024/1024
             mem_list.append(max(max_serv_mem, stable_serv_mem + max_cli_mem))
             shared_mem_list.append(shared_mem)
-            print('part{i}, N={num_nodes}, E={num_edges}, peak serv mem: {max_serv_mem:.3f} GB, '\
-                    'stable serv mem: {stable_serv_mem:.3f} GB, '\
-                    'shared mem: {shared_mem_list[-1]:.3f} GB, cli mem: {max_cli_mem:.3f} GB')
+            logging.info('part%d, N=%d, E=%d, peak serv mem: %.3f GB, ' + \
+                    'stable serv mem: %.3f GB, shared mem: %.3f GB, cli mem: %.3f GB',
+                         i, num_nodes, num_edges, max_serv_mem,
+                         stable_serv_mem, shared_mem_list[-1], max_cli_mem)
     return max(mem_list), max(shared_mem_list)
 
 def estimate_mem_infer(root, graph_name, hidden_size, num_layers):
@@ -122,7 +233,7 @@ def estimate_mem_infer(root, graph_name, hidden_size, num_layers):
     parts = []
     # Find the partition IDs from the folder.
     for f in os.listdir(root):
-        if os.path.isdir(os.path.join(root, f)):
+        if os.path.isdir(os.path.join(root, f)) and f.startswith("part"):
             parts.append(int(f[4:]))
     with open(os.path.join(root, graph_name + '.json'), 'r', encoding='utf-8') as f:
         schema = json.load(f)
@@ -167,10 +278,55 @@ def estimate_mem_infer(root, graph_name, hidden_size, num_layers):
             max_cli_mem = max_cli_mem / 1024/1024/1024
             mem_list.append(max(max_serv_mem, stable_serv_mem + max_cli_mem))
             shared_mem_list.append(shared_mem)
-            print(f'part {i}, N={num_nodes}, E={num_edges}, peak serv mem: {max_serv_mem:.3f} GB, '\
-                    'stable serv mem: {stable_serv_mem:.3f} GB, '\
-                    'shared mem: {shared_mem_list[-1]:.3f} GB, cli mem: {max_cli_mem:.3f} GB')
+            logging.info('part%d, N=%d, E=%d, peak serv mem: %.3f GB, ' + \
+                    'stable serv mem: %.3f GB, shared mem: %.3f GB, cli mem: %.3f GB',
+                         i, num_nodes, num_edges, max_serv_mem,
+                         stable_serv_mem, shared_mem_list[-1], max_cli_mem)
     return max(mem_list), max(shared_mem_list)
+
+def print_mem(device):
+    """ Print memory consumption
+    """
+    if th.cuda.is_available():
+        logging.info("Peak GPU Mem alloc: %.4f MB",
+                     th.cuda.max_memory_allocated(device) / 1024 / 1024)
+    else:
+        logging.info("Peak RAM Mem alloc: %.4f MB",
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
+
+def get_log_level(log_level):
+    """ Map the logging level.
+    """
+    if log_level == "debug":
+        return logging.DEBUG
+    elif log_level == "info":
+        return logging.INFO
+    elif log_level == "warning":
+        return logging.WARNING
+    elif log_level == "error":
+        return logging.ERROR
+    else:
+        raise ValueError(f"Unknown logging level {log_level}. " + \
+                "The possible values are: debug, info, warning, error.")
+
+def create_dist_tensor(shape, dtype, name=None, part_policy=None, persistent=False):
+    """ A wrapper function to create a distributed tensor.
+    """
+    tensor = dgl.distributed.DistTensor(shape, dtype, name=name,
+                                        part_policy=part_policy, persistent=persistent)
+    logging.debug("Create DistTensor of %s with shape of %s", name, str(tensor.shape))
+    return tensor
+
+def get_lm_ntypes(lm_configs):
+    """ Get the node types with text features.
+    """
+    if lm_configs is None:
+        return None
+
+    ntypes = []
+    for config in lm_configs:
+        ntypes.extend(config['node_types'])
+    return ntypes
 
 class SysTracker:
     """ This tracks the system performance.
@@ -321,7 +477,7 @@ class RuntimeProfiler:
         """
         if self._rank == 0 and self._profile_path is not None:
             for name, runtimes in self._runtime.items():
-                print(name, sum(runtimes) / len(runtimes), "seconds")
+                logging.info("%s %.3f seconds", name, sum(runtimes) / len(runtimes))
 
     def save_profile(self):
         """ Save the profiling result to a file.
@@ -333,7 +489,7 @@ class RuntimeProfiler:
             profile_path = os.path.join(self._profile_path, f"{self._rank}.csv")
             data_frame = pd.DataFrame(runtime)
             data_frame.to_csv(profile_path, float_format='%.3f', index=False)
-            print(f"save profiling in {profile_path}")
+            logging.info("Save profiling in %s.", profile_path)
 
 sys_tracker = SysTracker()
 rt_profiler = RuntimeProfiler()

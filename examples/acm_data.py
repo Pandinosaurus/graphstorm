@@ -30,9 +30,30 @@ import pandas as pd
 import numpy as np
 import torch as th
 import torch.nn as nn
-from dgl.data.utils import save_graphs
 
-from utils import convert_tensor_to_list_arrays
+
+def convert_tensor_to_list_arrays(tensor):
+    """ Convert Pytorch Tensor to a list of arrays
+    
+    Since a pandas DataFrame cannot save a 2D numpy array in parquet format, it is necessary to
+    convert the tensor (1D or 2D) into a list of lists or a list of array. This converted tensor
+    can then be used to build a pandas DataFrame, which can be saved in parquet format. However,
+    tensor with a dimension greater than or equal to 3D cannot be processed or saved into parquet
+    files.
+
+    Parameters:
+    tensor: Pytorch Tensor
+        The input Pytorch tensor (1D or 2D) to be converted
+    
+    Returns:
+    list_array: list of numpy arrays
+        A list of numpy arrays
+    """
+    
+    np_array = tensor.numpy()
+    list_array = [np_array[i] for i in range(len(np_array))]
+
+    return list_array
 
 
 def create_acm_raw_data(graph,
@@ -46,11 +67,20 @@ def create_acm_raw_data(graph,
     This graph is based on the DGL graph created by the create_acm_dgl_graph() function. Because we
     only use three relationships in the original ACM data, the number of graph nodes could be less 
     than the papers, authors, and subjects in the original node lists.
+    
+    In addition, to demonstrate the use of string type node ids in the raw graph data, we add the 
+    first letter of each node type name to the original numerical ids, i.e., "author" -> "a", 
+    "paper" -> "p", and "subject" -> "s".
 
     Parameters
     ----------
     graph : DGL heterogeneous graph
         The generated dgl.heterograph object.
+    text_feat: dict
+        The raw text of "paper", "author", and "subject" nodes.
+            For "paper" nodes, the text is paper's title plus abstract;
+            For "author" nodes, the text is author's full name;
+            For "subject" nodes, the text is the ACM's subject code, e.g., "A.0".
     output_path: str
         The folder path to save output files
 
@@ -62,12 +92,19 @@ def create_acm_raw_data(graph,
     # generate node dataframe: we use the graph node ids and node name as node_type
     node_list = []
 
+    # extract the first letter of each node type name as the prefix
+    node_prefix_dict = {}
+    for ntype in graph.ntypes:
+        node_prefix_dict[ntype] = ntype[0]
+
     for ntype in graph.ntypes:
         node_dict = {}
         # generate the id column
         node_ids = graph.nodes(ntype)
-        # convert tensor to list of arrays for saving in parquet format
-        node_dict['node_id'] = convert_tensor_to_list_arrays(node_ids)
+        # pad a prefix before each node id
+        str_node_ids = np.array([f'{node_prefix_dict[ntype]}{i}' for i in node_ids.numpy()])
+        
+        node_dict['node_id'] = str_node_ids
 
         # generate the feature columns and label column
         if graph.nodes[ntype].data:
@@ -98,9 +135,11 @@ def create_acm_raw_data(graph,
         edge_dict = {}
         # generate the ids columns for both source nodes and destination nodes
         src_ids, dst_ids = graph.edges(etype=(src_ntype, etype, dst_ntype))
-       # convert tensor to list of arrays for saving in parquet format
-        edge_dict['source_id'] = convert_tensor_to_list_arrays(src_ids)
-        edge_dict['dest_id'] = convert_tensor_to_list_arrays(dst_ids)
+        # pad a prefix before each node id
+        str_src_ids = np.array([f'{node_prefix_dict[src_ntype]}{i}' for i in src_ids.numpy()])
+        str_dst_ids = np.array([f'{node_prefix_dict[dst_ntype]}{i}' for i in dst_ids.numpy()])
+        edge_dict['source_id'] = str_src_ids
+        edge_dict['dest_id'] = str_dst_ids
         
         # generate feature columns and label col
         if graph.edges[(src_ntype, etype, dst_ntype)].data:
@@ -113,7 +152,13 @@ def create_acm_raw_data(graph,
                 # Here we assume all others are edge features
                 # convert tensor to list of arrays for saving in parquet format
                 edge_dict[feat_name] = convert_tensor_to_list_arrays(val)
-            
+
+        # Give ('paper', 'citing', 'paper') edge type categorical features for different tasks
+        if src_ntype == 'paper' and etype == 'citing' and dst_ntype == 'paper':
+            cates = ['C_' + str(i) for i in range(1, 17, 3)]
+            num_pvp_edges = graph.num_edges((src_ntype, etype, dst_ntype))
+            edge_dict['cate_feat'] = np.random.choice(cates, num_pvp_edges)
+
         # generate the pandas DataFrame that combine ids, and, if have, features and labels
         edge_df = pd.DataFrame(edge_dict)
         # add canonical edge type name and edge dataframe as a tuple
@@ -164,6 +209,7 @@ def create_acm_raw_data(graph,
                 label_dict['label_col'] = col
                 label_dict['task_type'] = 'classification'
                 label_dict['split_pct'] = [0.8, 0.1, 0.1]
+                label_dict['label_stats_type'] = 'frequency_cnt'
                 labels_list.append(label_dict)
             elif col == 'text':
                 feat_dict['feature_col'] = col
@@ -205,17 +251,20 @@ def create_acm_raw_data(graph,
             elif col == 'dest_id':
                 edge_dict['dest_id_col'] = col
             elif col == 'label':
-                label_dict['label_col'] = col
-                label_dict['task_type'] = 'classification'      # In ACM data, we do not have this
+                label_dict['task_type'] = 'link_prediction'     # In ACM data, we do not have this
                                                                 # edge task. Here is just for demo
                 label_dict['split_pct'] = [0.8, 0.1, 0.1]       # Same as the label_split filed.
                                                                 # The split pct values are just for
                                                                 # demonstration purpose.
                 labels_list.append(label_dict)
+            elif col.startswith('cate_'):                       # Dummy categorical features that ask
+                feat_dict['feature_col'] = col                  # for a "to_categorical" tranformation
+                feat_dict['feature_name'] = col                 # operation
+                feat_dict['transform'] = {"name": "to_categorical"}
+                feats_list.append(feat_dict)
             else:
                 feat_dict['feature_col'] = col
                 feat_dict['feature_name'] = col
-                # for this example, we do not have transform for features
                 feats_list.append(feat_dict)
         # set up the rest fileds of this node type
         if feats_list:
@@ -227,6 +276,7 @@ def create_acm_raw_data(graph,
         
     # generate the configuration JSON file
     data_json = {}
+    data_json['version'] = 'gconstruct-v0.1'
     data_json['nodes'] = node_jsons
     data_json['edges'] = edge_jsons
         
@@ -260,6 +310,17 @@ def create_acm_dgl_graph(dowload_path='/tmp/ACM.mat',
     -------
     graph_acm: DGL graph
         Return the generated DGL graph, and save it to the given output_path
+        - The graph has three types of nodes, "paper", "author", and "subject", and six types of
+        edges, including reversed edge types. 
+        - Each node have a 256 dimension random feature, and raw text, which is stored in the
+        text_feat dictionary.
+        - For "paper" nodes, each has a label that is the category of a paper, coming from the
+        PvsC relation. There are total 14 classes for paper nodes.
+    text_feat: dict
+        The raw text of "paper", "author", and "subject" nodes.
+            For "paper" nodes, the text is paper's title plus abstract;
+            For "author" nodes, the text is author's full name;
+            For "subject" nodes, the text is the ACM's subject code, e.g., "A.0".
     """
     if not os.path.exists(dowload_path):
         data_url = 'https://data.dgl.ai/dataset/ACM.mat'
@@ -321,10 +382,15 @@ def create_acm_dgl_graph(dowload_path='/tmp/ACM.mat',
         emb = nn.Parameter(th.Tensor(graph_acm.number_of_nodes(n_type), 256), requires_grad = False)
         nn.init.xavier_uniform_(emb)
         graph_acm.nodes[n_type].data['feat'] = emb
-    
+
+    # For link prediction task, use "paper, citing, paper" edges as targe-etype and create labels.
+    target_etype = ('paper', 'citing', 'paper')
+    graph_acm.edges[target_etype].data['label'] = th.ones(graph_acm.num_edges(target_etype))
+
     print(graph_acm)
     print(f'\n Number of classes: {labels.max() + 1}')
-    print(f'\n Paper nodes labels: {labels.shape}')
+    print(f'\n Paper node labels: {labels.shape}')
+    print(f'\n {target_etype} edge labels:{graph_acm.num_edges(target_etype)}')
     
     # Save the graph for later partition
     if dataset_name is None:
@@ -336,7 +402,7 @@ def create_acm_dgl_graph(dowload_path='/tmp/ACM.mat',
         # Save DGL graph
         output_graph_file_path = os.path.join(output_path, dataset_name + '.dgl')
         print(f'Saving ACM data to {output_graph_file_path} ......')
-        save_graphs(output_graph_file_path, [graph_acm], None)
+        dgl.save_graphs(output_graph_file_path, [graph_acm], None)
         print(f'{output_graph_file_path} saved.')
         # Save raw node text
         output_text_file_path = os.path.join(output_path, dataset_name + '_text.pkl')
